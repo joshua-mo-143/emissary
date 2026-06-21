@@ -1,6 +1,6 @@
 use crate::actions::{Action, RunContext, RunOutcome, RunRequest, run_actions, tool_schema};
 use crate::payment::PaymentVault;
-use crate::review::handoff_payload;
+use crate::review::{HandoffReason, handoff_payload};
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use serde_json::{Value, json};
@@ -14,7 +14,6 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const PROFILE_DIR: &str = "automation-profile";
 const RUNTIME_DIR: &str = ".agent-runtime";
@@ -25,61 +24,49 @@ pub struct ManagedDaemon {
     lock_path: PathBuf,
 }
 
-pub struct BrowserResponse {
-    status: u16,
-    kind: BrowserResponseKind,
+pub struct BrowserRunResult {
+    kind: BrowserRunResultKind,
     body: Value,
 }
 
-enum BrowserResponseKind {
+enum BrowserRunResultKind {
     Success,
     Error,
     NeedsHuman,
 }
 
-impl BrowserResponse {
+impl BrowserRunResult {
     fn success(body: Value) -> Self {
         Self {
-            status: 200,
-            kind: BrowserResponseKind::Success,
+            kind: BrowserRunResultKind::Success,
             body,
         }
     }
 
     fn error(body: Value) -> Self {
         Self {
-            status: 200,
-            kind: BrowserResponseKind::Error,
+            kind: BrowserRunResultKind::Error,
             body,
         }
     }
 
     fn needs_human(body: Value) -> Self {
         Self {
-            status: 409,
-            kind: BrowserResponseKind::NeedsHuman,
+            kind: BrowserRunResultKind::NeedsHuman,
             body,
         }
-    }
-
-    pub fn status(&self) -> u16 {
-        self.status
     }
 
     pub fn body(&self) -> &Value {
         &self.body
     }
 
-    pub fn into_body(self) -> Value {
-        self.body
-    }
-
     pub fn is_error(&self) -> bool {
-        matches!(self.kind, BrowserResponseKind::Error)
+        matches!(self.kind, BrowserRunResultKind::Error)
     }
 
     pub fn needs_human_handoff(&self) -> bool {
-        matches!(self.kind, BrowserResponseKind::NeedsHuman)
+        matches!(self.kind, BrowserRunResultKind::NeedsHuman)
     }
 }
 
@@ -92,7 +79,6 @@ impl ManagedDaemon {
         let display = display_num();
         let vnc_port = env_u16("VNC_PORT", 5900);
         let novnc_port = env_u16("NOVNC_PORT", 6080);
-        let api_addr = env_string("API_ADDR", "127.0.0.1:8787");
         let screen = screen_spec();
         let display_name = format!(":{display}");
 
@@ -164,7 +150,6 @@ impl ManagedDaemon {
             &DaemonLock {
                 owner_pid: std::process::id(),
                 child_pids: vec![xvfb.pid(), x11vnc.pid(), novnc.pid()],
-                api_addr: api_addr.clone(),
                 started_at: session_id(),
             },
         )?;
@@ -179,7 +164,6 @@ impl ManagedDaemon {
             paused: false,
             session_id: session_id(),
             handoff_url,
-            api_addr,
             screen,
         };
 
@@ -204,10 +188,6 @@ impl ManagedDaemon {
         Ok(())
     }
 
-    pub fn api_addr(&self) -> &str {
-        &self.runtime().api_addr
-    }
-
     pub fn status(&self) -> Value {
         self.runtime().status()
     }
@@ -220,7 +200,7 @@ impl ManagedDaemon {
         self.runtime().payment.keys()
     }
 
-    pub fn run(&mut self, actions: Vec<Action>) -> Result<BrowserResponse> {
+    pub fn run(&mut self, actions: Vec<Action>) -> Result<BrowserRunResult> {
         let runtime = self
             .runtime
             .as_mut()
@@ -232,11 +212,11 @@ impl ManagedDaemon {
                 .iter()
                 .all(|action| matches!(action, Action::Resume))
         {
-            return Ok(BrowserResponse::needs_human(json!(handoff_payload(
+            return Ok(BrowserRunResult::needs_human(json!(handoff_payload(
                 &runtime.tab,
                 &runtime.session_id,
                 &runtime.handoff_url,
-                "human handoff is active",
+                HandoffReason::already_paused(),
             ))));
         }
 
@@ -249,28 +229,11 @@ impl ManagedDaemon {
         };
 
         match run_actions(&mut context, &run_request)? {
-            RunOutcome::Success(success) => Ok(BrowserResponse::success(json!(success))),
-            RunOutcome::Failed(failure) => Ok(BrowserResponse::error(json!(failure))),
+            RunOutcome::Success(success) => Ok(BrowserRunResult::success(json!(success))),
+            RunOutcome::Failed(failure) => Ok(BrowserRunResult::error(json!(failure))),
             RunOutcome::NeedsHuman { handoff, .. } => {
-                Ok(BrowserResponse::needs_human(json!(handoff)))
+                Ok(BrowserRunResult::needs_human(json!(handoff)))
             }
-        }
-    }
-
-    pub fn handoff(&mut self, reason: &str) -> Value {
-        let runtime = self.runtime.as_mut().expect("daemon running");
-        runtime.paused = true;
-        json!(handoff_payload(
-            &runtime.tab,
-            &runtime.session_id,
-            &runtime.handoff_url,
-            reason,
-        ))
-    }
-
-    pub fn resume(&mut self) {
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.paused = false;
         }
     }
 
@@ -296,7 +259,6 @@ impl Drop for ManagedDaemon {
 struct DaemonLock {
     owner_pid: u32,
     child_pids: Vec<u32>,
-    api_addr: String,
     started_at: String,
 }
 
@@ -308,11 +270,7 @@ fn reclaim_stale_daemon(runtime_dir: &Path) -> Result<()> {
 
     let lock = read_lock(&lock_path)?;
     if process_alive(lock.owner_pid) {
-        bail!(
-            "Emissary daemon already running (pid {} on {})",
-            lock.owner_pid,
-            lock.api_addr
-        );
+        bail!("Emissary daemon already running (pid {})", lock.owner_pid);
     }
 
     eprintln!(
@@ -381,7 +339,6 @@ struct Runtime {
     paused: bool,
     session_id: String,
     handoff_url: String,
-    api_addr: String,
     screen: String,
 }
 
@@ -391,9 +348,7 @@ impl Runtime {
             "status": if self.paused { "needs_human" } else { "ready" },
             "session_id": self.session_id,
             "handoff_url": self.handoff_url,
-            "api_addr": self.api_addr,
             "screen": self.screen,
-            "tool": "/schema",
         })
     }
 }
@@ -658,75 +613,6 @@ fn detected_screen() -> Option<String> {
     })?;
 
     Some(format!("{dimensions}x24"))
-}
-
-#[allow(dead_code)]
-pub fn serve_blocking() -> Result<()> {
-    let mut daemon = ManagedDaemon::start()?;
-    let ready = daemon.status();
-    println!("{}", serde_json::to_string_pretty(&ready)?);
-
-    let api_addr = daemon.api_addr().to_owned();
-    let server = Server::http(&api_addr).map_err(|error| anyhow!("{error}"))?;
-
-    for request in server.incoming_requests() {
-        if let Err(error) = handle_request(request, &mut daemon) {
-            eprintln!("{error:#}");
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_request(mut request: Request, daemon: &mut ManagedDaemon) -> Result<()> {
-    let method = request.method().clone();
-    let path = request.url().split('?').next().unwrap_or("/").to_owned();
-
-    let response = match (method, path.as_str()) {
-        (Method::Get, "/status") | (Method::Get, "/") => {
-            json_response(StatusCode(200), daemon.status())
-        }
-        (Method::Get, "/schema") => json_response(StatusCode(200), daemon.schema()),
-        (Method::Get, "/payment/keys") => {
-            json_response(StatusCode(200), json!({ "keys": daemon.payment_keys() }))
-        }
-        (Method::Post, "/handoff") => {
-            json_response(StatusCode(200), daemon.handoff("manual handoff requested"))
-        }
-        (Method::Post, "/resume") => {
-            daemon.resume();
-            json_response(
-                StatusCode(200),
-                json!({ "status": "ready", "session_id": daemon.status()["session_id"].clone() }),
-            )
-        }
-        (Method::Post, "/run") | (Method::Post, "/task") => {
-            let body = read_request_body(&mut request)?;
-            let run_request = parse_run_request(&body)?;
-            let response = daemon.run(run_request.actions)?;
-            json_response(StatusCode(response.status()), response.into_body())
-        }
-        _ => json_response(
-            StatusCode(404),
-            json!({ "status": "error", "error": "not found" }),
-        ),
-    };
-
-    request.respond(response)?;
-    Ok(())
-}
-
-fn read_request_body(request: &mut Request) -> Result<String> {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    Ok(body)
-}
-
-fn json_response(status: StatusCode, body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
-    let body = serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec());
-    Response::from_data(body)
-        .with_status_code(status)
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
 }
 
 #[cfg(test)]

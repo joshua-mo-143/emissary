@@ -1,13 +1,11 @@
 use crate::payment::{PaymentVault, block_type_on_payment_field, is_sensitive_submit};
-use crate::review::{self, HandoffPayload, capture_order_review};
+use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
 use headless_chrome::Tab;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{sync::Arc, thread, time::Duration};
-
-pub const SENSITIVE_CLICK: &str = "sensitive click blocked:";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -237,18 +235,12 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
                 ok,
             }),
             Err(error) => {
-                let message = error.to_string();
-                if message.starts_with(SENSITIVE_CLICK)
-                    || message.starts_with(review::auth_challenge_prefix())
-                    || message.starts_with(review::bot_challenge_prefix())
-                    || message.starts_with("manual handoff requested")
-                    || message.starts_with("human handoff is active")
-                {
+                if let Some(reason) = review::handoff_reason(&error) {
                     let handoff = review::handoff_payload(
                         context.tab.as_ref(),
                         context.session_id,
                         context.handoff_url,
-                        message,
+                        reason,
                     );
                     if let Some(paused) = context.paused.as_deref_mut() {
                         *paused = true;
@@ -259,6 +251,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
                         handoff,
                     });
                 }
+                let message = error.to_string();
                 return Ok(RunOutcome::Failed(RunFailure {
                     status: "error",
                     completed: index,
@@ -282,7 +275,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
                 context.tab.as_ref(),
                 context.session_id,
                 context.handoff_url,
-                review::bot_challenge_prefix(),
+                HandoffReason::bot_challenge(),
             ),
         });
     }
@@ -326,13 +319,17 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::ClickRef { ref_id } => {
             let details = element_ref_details(tab, ref_id)?;
             if is_sensitive_submit(&details) {
-                bail!("{SENSITIVE_CLICK} {details}");
+                return Err(review::handoff_required(HandoffReason::sensitive_submit(
+                    details,
+                )));
             }
             click_by_ref(tab, ref_id)
         }
         Action::ClickText { text } => {
             if is_sensitive_submit(text) {
-                bail!("{SENSITIVE_CLICK} {text}");
+                return Err(review::handoff_required(HandoffReason::sensitive_submit(
+                    text.clone(),
+                )));
             }
             click_by_visible_text(tab, text)
         }
@@ -376,11 +373,11 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
             if let Some(paused) = context.paused.as_deref_mut() {
                 *paused = true;
             }
-            bail!("manual handoff requested");
+            Err(review::handoff_required(HandoffReason::manual()))
         }
         Action::Resume => {
             let Some(paused) = context.paused.as_deref_mut() else {
-                bail!("resume is only available in serve mode");
+                bail!("resume is only available in a managed browser session");
             };
             if !*paused {
                 bail!("automation is not paused");
@@ -798,7 +795,9 @@ fn truncate_page_text(text: String) -> String {
 fn block_sensitive_click(tab: &Tab, selector: &str) -> Result<()> {
     let details = clickable_details(tab, selector)?;
     if is_sensitive_submit(&details) {
-        bail!("{SENSITIVE_CLICK} {details}");
+        return Err(review::handoff_required(HandoffReason::sensitive_submit(
+            details,
+        )));
     }
     Ok(())
 }
