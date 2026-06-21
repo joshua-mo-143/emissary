@@ -306,7 +306,7 @@ fn run_agent_turn(
                             show_browser_error_to_user(response.body());
                             stop_after_tool_error = true;
                         }
-                        format_tool_result_for_model(response.status(), response.body())
+                        format_tool_result_for_model(response.body())
                     }
                     Err(error) => {
                         stop_after_tool_error = true;
@@ -475,11 +475,10 @@ fn show_browser_error_to_user(body: &Value) {
     }
 }
 
-fn format_tool_result_for_model(status: u16, body: &Value) -> String {
+fn format_tool_result_for_model(body: &Value) -> String {
     let mut sanitized = body.clone();
     strip_screenshot_data(&mut sanitized);
     let mut out = Map::new();
-    out.insert("http_status".to_owned(), json!(status));
     if let Value::Object(map) = sanitized {
         out.extend(map);
     }

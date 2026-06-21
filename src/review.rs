@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use headless_chrome::{Tab, protocol::cdp::Page::CaptureScreenshotFormatOption};
 use serde::Serialize;
 use serde_json::Value;
+use std::{error::Error, fmt};
 
 const AUTH_CHALLENGE: &str = "auth challenge detected:";
 const BOT_CHALLENGE: &str = "bot challenge detected:";
@@ -69,7 +70,7 @@ pub struct HandoffPayload {
     pub reason: String,
     pub session_id: String,
     pub handoff_url: String,
-    pub resume: &'static str,
+    pub resume: ResumeInstruction,
     #[serde(rename = "pageState", skip_serializing_if = "Option::is_none")]
     pub page_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +81,89 @@ pub struct HandoffPayload {
     pub review: Option<OrderReview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffReason {
+    SensitiveSubmit(String),
+    AuthChallenge,
+    BotChallenge,
+    Manual,
+    AlreadyPaused,
+}
+
+impl HandoffReason {
+    pub fn sensitive_submit(details: impl Into<String>) -> Self {
+        Self::SensitiveSubmit(details.into())
+    }
+
+    pub fn auth_challenge() -> Self {
+        Self::AuthChallenge
+    }
+
+    pub fn bot_challenge() -> Self {
+        Self::BotChallenge
+    }
+
+    pub fn manual() -> Self {
+        Self::Manual
+    }
+
+    pub fn already_paused() -> Self {
+        Self::AlreadyPaused
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::SensitiveSubmit(details) => format!("sensitive click blocked: {details}"),
+            Self::AuthChallenge => {
+                format!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url")
+            }
+            Self::BotChallenge => format!(
+                "{BOT_CHALLENGE} Cloudflare is blocking the automated browser. If the challenge does not fully load in handoff, use a normal browser or choose another site."
+            ),
+            Self::Manual => "manual handoff requested".to_owned(),
+            Self::AlreadyPaused => "human handoff is active".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HandoffRequired {
+    reason: HandoffReason,
+}
+
+impl HandoffRequired {
+    pub fn new(reason: HandoffReason) -> Self {
+        Self { reason }
+    }
+
+    pub fn reason(&self) -> &HandoffReason {
+        &self.reason
+    }
+}
+
+impl fmt::Display for HandoffRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason.message())
+    }
+}
+
+impl Error for HandoffRequired {}
+
+pub fn handoff_required(reason: HandoffReason) -> anyhow::Error {
+    anyhow::Error::new(HandoffRequired::new(reason))
+}
+
+pub fn handoff_reason(error: &anyhow::Error) -> Option<HandoffReason> {
+    error
+        .downcast_ref::<HandoffRequired>()
+        .map(|handoff| handoff.reason().clone())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeInstruction {
+    pub op: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,14 +183,6 @@ pub struct OrderReview {
     pub screenshot_mime: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_note: Option<String>,
-}
-
-pub fn auth_challenge_prefix() -> &'static str {
-    AUTH_CHALLENGE
-}
-
-pub fn bot_challenge_prefix() -> &'static str {
-    BOT_CHALLENGE
 }
 
 pub fn page_needs_bot_challenge(tab: &Tab) -> Result<bool> {
@@ -144,7 +220,7 @@ pub fn page_needs_bot_challenge(tab: &Tab) -> Result<bool> {
 
 pub fn ensure_not_bot_challenge(tab: &Tab) -> Result<()> {
     if page_needs_bot_challenge(tab)? {
-        bail!("{BOT_CHALLENGE} complete the Cloudflare or bot check via handoff_url, then resume");
+        return Err(handoff_required(HandoffReason::bot_challenge()));
     }
     Ok(())
 }
@@ -190,7 +266,7 @@ pub fn is_auth_challenge_text(text: &str) -> bool {
 
 pub fn capture_order_review(tab: &Tab) -> Result<OrderReview> {
     if page_needs_interactive_auth(tab)? {
-        bail!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url");
+        return Err(handoff_required(HandoffReason::auth_challenge()));
     }
 
     let target = find_order_review_target(tab)?;
@@ -221,17 +297,13 @@ pub fn handoff_payload(
     tab: &Tab,
     session_id: &str,
     handoff_url: &str,
-    reason: impl Into<String>,
+    reason: HandoffReason,
 ) -> HandoffPayload {
-    let reason = reason.into();
-
     if page_needs_bot_challenge(tab).unwrap_or(false) {
         return HandoffPayload::blocked(
             session_id,
             handoff_url,
-            format!(
-                "{BOT_CHALLENGE} Cloudflare is blocking the automated browser. If the challenge does not fully load in handoff, use a normal browser or choose another site."
-            ),
+            HandoffReason::bot_challenge().message(),
         );
     }
 
@@ -239,25 +311,40 @@ pub fn handoff_payload(
         return HandoffPayload::interactive(
             session_id,
             handoff_url,
-            format!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url"),
+            HandoffReason::auth_challenge().message(),
         );
     }
 
     match capture_order_review(tab) {
-        Ok(review) => HandoffPayload::review(session_id, handoff_url, reason, Some(review), None),
-        Err(error) if error.to_string().starts_with(AUTH_CHALLENGE) => {
-            HandoffPayload::interactive(session_id, handoff_url, error.to_string())
-        }
-        Err(error) if error.to_string().starts_with(BOT_CHALLENGE) => {
-            HandoffPayload::blocked(session_id, handoff_url, error.to_string())
-        }
-        Err(error) => HandoffPayload::review(
+        Ok(review) => HandoffPayload::review(
             session_id,
             handoff_url,
-            reason,
+            reason.message(),
+            Some(review),
             None,
-            Some(error.to_string()),
         ),
+        Err(error) => match handoff_reason(&error) {
+            Some(HandoffReason::AuthChallenge) => {
+                HandoffPayload::interactive(session_id, handoff_url, error.to_string())
+            }
+            Some(HandoffReason::BotChallenge) => {
+                HandoffPayload::blocked(session_id, handoff_url, error.to_string())
+            }
+            Some(reason) => HandoffPayload::review(
+                session_id,
+                handoff_url,
+                reason.message(),
+                None,
+                Some(error.to_string()),
+            ),
+            None => HandoffPayload::review(
+                session_id,
+                handoff_url,
+                reason.message(),
+                None,
+                Some(error.to_string()),
+            ),
+        },
     }
 }
 
@@ -275,7 +362,7 @@ impl HandoffPayload {
             reason,
             session_id: session_id.to_owned(),
             handoff_url: handoff_url.to_owned(),
-            resume: "POST /resume",
+            resume: resume_instruction(),
             page_state: None,
             retry: None,
             guidance: None,
@@ -291,7 +378,7 @@ impl HandoffPayload {
             reason,
             session_id: session_id.to_owned(),
             handoff_url: handoff_url.to_owned(),
-            resume: "POST /resume",
+            resume: resume_instruction(),
             page_state: None,
             retry: None,
             guidance: None,
@@ -307,7 +394,7 @@ impl HandoffPayload {
             reason,
             session_id: session_id.to_owned(),
             handoff_url: handoff_url.to_owned(),
-            resume: "POST /resume",
+            resume: resume_instruction(),
             page_state: Some("bot_challenge".to_owned()),
             retry: Some(false),
             guidance: Some("Do not keep retrying automation on this page. Ask the user whether to use another food site, continue manually in their normal browser, or try again after they pass Cloudflare outside the harness.".to_owned()),
@@ -315,6 +402,10 @@ impl HandoffPayload {
             review_error: None,
         }
     }
+}
+
+fn resume_instruction() -> ResumeInstruction {
+    ResumeInstruction { op: "resume" }
 }
 
 struct ReviewTarget {
@@ -424,7 +515,8 @@ fn is_payment_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffPayload, is_auth_challenge_text, is_bot_challenge_text, sanitize_summary_text,
+        HandoffPayload, HandoffReason, handoff_reason, handoff_required, is_auth_challenge_text,
+        is_bot_challenge_text, sanitize_summary_text,
     };
 
     #[test]
@@ -482,5 +574,12 @@ mod tests {
         assert_eq!(value["mode"], "blocked");
         assert_eq!(value["pageState"], "bot_challenge");
         assert_eq!(value["retry"], false);
+        assert_eq!(value["resume"]["op"], "resume");
+    }
+
+    #[test]
+    fn extracts_typed_handoff_reason_from_error() {
+        let error = handoff_required(HandoffReason::manual());
+        assert_eq!(handoff_reason(&error), Some(HandoffReason::Manual));
     }
 }
