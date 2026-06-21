@@ -13,6 +13,10 @@ use std::{
 };
 
 const MAX_AGENT_STEPS: usize = 12;
+const AUTO_CONTINUE_PROMPT: &str = "\
+Continue the user's task now. Your previous response looked like an intermediate progress update \
+after a browser tool result, not a final answer. If the task is complete or you need user input, \
+state that clearly; otherwise call the browser tool for the next step.";
 
 pub fn chat() -> Result<()> {
     let runtime_dir = runtime_dir()?;
@@ -271,22 +275,33 @@ fn run_agent_turn(
     messages: &mut Vec<ChatMessage>,
     runtime_dir: &PathBuf,
 ) -> Result<AgentReply> {
+    let mut pending_successful_tool_result = false;
+
     for _ in 0..MAX_AGENT_STEPS {
         let response = llm.complete(messages, std::slice::from_ref(tool))?;
         let tool_calls = response.tool_calls.clone().unwrap_or_default();
 
         if tool_calls.is_empty() {
             let text = response.content_text().to_owned();
+            if pending_successful_tool_result && should_auto_continue_after_tool_response(&text) {
+                messages.push(ChatMessage::assistant_text(text));
+                messages.push(ChatMessage::user(AUTO_CONTINUE_PROMPT));
+                pending_successful_tool_result = false;
+                continue;
+            }
+
             return Ok(AgentReply {
                 message: ChatMessage::assistant_text(text.clone()),
                 text,
             });
         }
 
+        pending_successful_tool_result = false;
         messages.push(response);
 
         for call in tool_calls {
             let mut stop_after_tool_error = false;
+            let mut successful_tool_result_can_continue = false;
             let call_id = call.id.clone();
             let name = call.function.name.as_str();
             let arguments = call.function.arguments.as_str();
@@ -306,6 +321,7 @@ fn run_agent_turn(
                             stop_after_tool_error = true;
                         } else {
                             show_browser_images_to_user(response.body(), runtime_dir)?;
+                            successful_tool_result_can_continue = true;
                         }
                         format_tool_result_for_model(response.body())
                     }
@@ -317,6 +333,7 @@ fn run_agent_turn(
             };
 
             messages.push(ChatMessage::tool(call_id, tool_content));
+            pending_successful_tool_result |= successful_tool_result_can_continue;
 
             if stop_after_tool_error {
                 messages.push(ChatMessage::system("The browser tool just returned a recoverable error. Do not call tools again in this turn. Briefly explain what failed and ask the user how to proceed or suggest a safer next step."));
@@ -341,6 +358,100 @@ fn run_agent_turn(
         message: ChatMessage::assistant_text(text.clone()),
         text,
     })
+}
+
+fn should_auto_continue_after_tool_response(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    !asks_for_user_or_handoff(trimmed, &lower) && !has_clear_final_signal(&lower)
+}
+
+fn asks_for_user_or_handoff(text: &str, lower: &str) -> bool {
+    if text.contains('?') {
+        return true;
+    }
+
+    [
+        "please tell",
+        "please let",
+        "please choose",
+        "please confirm",
+        "please log",
+        "please sign",
+        "please complete",
+        "please open",
+        "please use",
+        "please review",
+        "please submit",
+        "let me know",
+        "tell me",
+        "you need to",
+        "i need you",
+        "need your",
+        "waiting for",
+        "log in",
+        "login",
+        "sign in",
+        "captcha",
+        "cloudflare",
+        "blocked",
+        "handoff",
+        "manual",
+        "manually",
+        "authentication",
+        "authenticate",
+        "verification",
+        "verify your",
+        "2fa",
+        "bank",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+fn has_clear_final_signal(lower: &str) -> bool {
+    [
+        "all set",
+        "you're all set",
+        "done",
+        "completed",
+        "finished",
+        "task is complete",
+        "i've completed",
+        "i have completed",
+        "i've finished",
+        "i have finished",
+        "i found",
+        "i located",
+        "i couldn't",
+        "i could not",
+        "i can't",
+        "i cannot",
+        "i was unable",
+        "unable to",
+        "here is",
+        "here are",
+        "the answer is",
+        "summary",
+        "final",
+        "shown to you",
+        "shown to the user",
+        "image saved",
+        "screenshot saved",
+        "captured the screenshot",
+        "ready for you",
+        "ready to submit",
+        "ready for review",
+        "out of stock",
+        "unavailable",
+        "closed",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 fn parse_browser_arguments(arguments: &str) -> Result<Vec<Action>> {
@@ -643,7 +754,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionResponse, parse_browser_arguments};
+    use super::{
+        ChatCompletionResponse, parse_browser_arguments, should_auto_continue_after_tool_response,
+    };
     use crate::actions::Action;
 
     #[test]
@@ -698,5 +811,37 @@ mod tests {
         let actions =
             parse_browser_arguments(r#"{"actions":[{"op":"webSearch","query":"rust"}]}"#).unwrap();
         assert!(matches!(actions[0], Action::WebSearch { .. }));
+    }
+
+    #[test]
+    fn auto_continues_empty_post_tool_response() {
+        assert!(should_auto_continue_after_tool_response("   "));
+    }
+
+    #[test]
+    fn auto_continues_ambiguous_post_tool_progress() {
+        assert!(should_auto_continue_after_tool_response(
+            "The page has loaded and I can see the search results."
+        ));
+    }
+
+    #[test]
+    fn does_not_auto_continue_when_waiting_for_user() {
+        assert!(!should_auto_continue_after_tool_response(
+            "Please review the order and submit it in the handoff browser."
+        ));
+        assert!(!should_auto_continue_after_tool_response(
+            "Which restaurant should I use?"
+        ));
+    }
+
+    #[test]
+    fn does_not_auto_continue_clear_final_response() {
+        assert!(!should_auto_continue_after_tool_response(
+            "Done - I found the restaurant's current hours."
+        ));
+        assert!(!should_auto_continue_after_tool_response(
+            "I was unable to find that item in stock."
+        ));
     }
 }
