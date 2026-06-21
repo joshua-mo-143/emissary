@@ -1,4 +1,6 @@
-use crate::payment::{PaymentVault, block_type_on_payment_field, is_sensitive_submit};
+use crate::payment::{
+    PaymentFieldMapping, PaymentVault, block_type_on_payment_field, is_sensitive_submit,
+};
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
@@ -56,6 +58,9 @@ pub enum Action {
     },
     FillPayment {
         profile: String,
+    },
+    FillPaymentRefs {
+        fields: Vec<PaymentFieldMapping>,
     },
     FillPaymentField {
         selector: String,
@@ -179,8 +184,29 @@ pub fn tool_schema() -> Value {
                         { "type": "object", "required": ["op"], "properties": { "op": { "const": "text" }, "selector": { "type": "string", "default": "body" } } },
                         { "type": "object", "required": ["op"], "properties": { "op": { "const": "html" }, "selector": { "type": "string", "default": "body" } } },
                         { "type": "object", "required": ["op", "expression"], "properties": { "op": { "const": "eval" }, "expression": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "profile"], "properties": { "op": { "const": "fillPayment" }, "profile": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "selector", "field"], "properties": { "op": { "const": "fillPaymentField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:field, e.g. default:cvc" } } },
+                        { "type": "object", "required": ["op", "profile"], "description": "Legacy automatic payment form fill by profile key. Prefer observe -> fillPaymentRefs when element refs are available.", "properties": { "op": { "const": "fillPayment" }, "profile": { "type": "string" } } },
+                        {
+                            "type": "object",
+                            "required": ["op", "fields"],
+                            "description": "Fill payment fields by observed element refs. The LLM supplies credential variable IDs only, never secret values.",
+                            "properties": {
+                                "op": { "const": "fillPaymentRefs" },
+                                "fields": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "description": "Mappings from observe refs to payment vault field IDs.",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["refId", "field"],
+                                        "properties": {
+                                            "refId": { "type": "string", "description": "Input/select element ref returned by observe/current page elements" },
+                                            "field": { "type": "string", "description": "Vault credential ID, e.g. default:card_number, default:exp, default:cvc, default:name, default:postal_code. Omit profile only for the default profile." }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        { "type": "object", "required": ["op", "selector", "field"], "description": "Fill one payment field by selector and vault field ID. Prefer fillPaymentRefs when refs are available.", "properties": { "op": { "const": "fillPaymentField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:field, e.g. default:cvc" } } },
                         { "type": "object", "required": ["op"], "description": "Capture a safe product/page screenshot for the user. Refuses screenshots when payment fields are visible. Optional selector captures a specific visible element.", "properties": { "op": { "const": "screenshot" }, "selector": { "type": "string", "description": "Optional CSS selector for a product image or page region" } } },
                         { "type": "object", "required": ["op"], "description": "Capture an order-summary review. Falls back to a safe visible-page screenshot if no basket summary is found and no payment fields are visible.", "properties": { "op": { "const": "review" } } },
                         { "type": "object", "required": ["op"], "description": "Pause automation and return handoff_url", "properties": { "op": { "const": "handoff" } } },
@@ -370,6 +396,9 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillPayment { profile } => {
             PaymentVault::fill_payment(tab, context.payment, profile)
         }
+        Action::FillPaymentRefs { fields } => {
+            PaymentVault::fill_payment_refs(tab, context.payment, fields)
+        }
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
         }
@@ -414,6 +443,7 @@ fn op_name(action: &Action) -> &'static str {
         Action::Html { .. } => "html",
         Action::Eval { .. } => "eval",
         Action::FillPayment { .. } => "fillPayment",
+        Action::FillPaymentRefs { .. } => "fillPaymentRefs",
         Action::FillPaymentField { .. } => "fillPaymentField",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
@@ -442,6 +472,14 @@ fn action_detail(action: &Action) -> String {
         Action::Html { selector } => format!("html selector={selector:?}"),
         Action::Eval { expression } => format!("eval expression={expression:?}"),
         Action::FillPayment { profile } => format!("fillPayment profile={profile}"),
+        Action::FillPaymentRefs { fields } => {
+            let mappings = fields
+                .iter()
+                .map(|field| format!("{}={}", field.ref_id, field.field))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("fillPaymentRefs fields=[{mappings}]")
+        }
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
         }
@@ -903,6 +941,15 @@ mod tests {
         assert!(matches!(request.actions[0], Action::Observe));
         assert!(matches!(request.actions[1], Action::ClickRef { .. }));
         assert!(matches!(request.actions[2], Action::TypeRef { .. }));
+    }
+
+    #[test]
+    fn parses_payment_ref_fill_action() {
+        let request: RunRequest = serde_json::from_str(
+            r#"{"actions":[{"op":"fillPaymentRefs","fields":[{"refId":"e2","field":"default:card_number"},{"refId":"e3","field":"default:cvc"}]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.actions[0], Action::FillPaymentRefs { .. }));
     }
 
     #[test]

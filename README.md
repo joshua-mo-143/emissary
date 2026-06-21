@@ -86,6 +86,26 @@ Prefer the ref flow for dynamic consumer sites:
 2. Use `clickRef` / `typeRef` with those refs instead of guessing CSS selectors.
 3. Fall back to `click`, `type`, or `html` only when refs are insufficient.
 
+For payment forms, use the same ref flow without exposing card values:
+
+```json
+{
+  "actions": [
+    { "op": "observe" },
+    {
+      "op": "fillPaymentRefs",
+      "fields": [
+        { "refId": "e7", "field": "default:card_number" },
+        { "refId": "e8", "field": "default:exp" },
+        { "refId": "e9", "field": "default:cvc" }
+      ]
+    }
+  ]
+}
+```
+
+`field` is a vault credential ID, not a secret value. Supported IDs are `card_number`, `exp`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`, optionally prefixed with a profile such as `default:cvc`.
+
 One-shot headless run (separate from chat, for testing):
 
 ```sh

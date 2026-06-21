@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::Tab;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -131,6 +131,13 @@ pub struct PaymentVault {
     profiles: HashMap<String, PaymentProfile>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PaymentFieldMapping {
+    #[serde(rename = "refId")]
+    pub ref_id: String,
+    pub field: String,
+}
+
 impl PaymentVault {
     pub fn load() -> Result<Self> {
         let path = payment_file_path();
@@ -216,6 +223,32 @@ impl PaymentVault {
         Ok(json!({
             "filled_payment": profile_key,
             "fields": filled,
+        }))
+    }
+
+    pub fn fill_payment_refs(
+        tab: &Tab,
+        vault: &PaymentVault,
+        mappings: &[PaymentFieldMapping],
+    ) -> Result<Value> {
+        if mappings.is_empty() {
+            bail!("fillPaymentRefs requires at least one field mapping");
+        }
+
+        let mut filled = Vec::new();
+        for mapping in mappings {
+            let (profile_key, field_name) = parse_field_ref(&mapping.field)?;
+            let value = vault.secret(profile_key, field_name)?;
+            let details = inject_into_ref(tab, &mapping.ref_id, value.expose())?;
+            filled.push(json!({
+                "refId": mapping.ref_id.as_str(),
+                "field": format!("{profile_key}:{field_name}"),
+                "tag": details.get("tag").cloned().unwrap_or(Value::Null),
+            }));
+        }
+
+        Ok(json!({
+            "filled_payment_refs": filled,
         }))
     }
 
@@ -339,6 +372,14 @@ fn normalize_year(raw: &str) -> Result<String> {
     }
 }
 
+fn value_to_string(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 fn payment_file_path() -> PathBuf {
     std::env::var(PAYMENT_FILE_ENV)
         .map(PathBuf::from)
@@ -426,6 +467,85 @@ fn inject_into_selector(tab: &Tab, css: &str, value: &str) -> Result<()> {
     }
 }
 
+fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
+    let ref_json = serde_json::to_string(ref_id)?;
+    let value_json = serde_json::to_string(value)?;
+    let js = format!(
+        r##"(() => {{
+            const refId = {ref_json};
+            const value = {value_json};
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
+            if (!el) {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "unknown element ref; call observe again"
+                }});
+            }}
+            if (el.disabled || el.readOnly) {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "element is disabled or read-only"
+                }});
+            }}
+
+            el.scrollIntoView({{ block: "center", inline: "center" }});
+            el.focus();
+            if (el.tagName.toLowerCase() === "select") {{
+                const exact = Array.from(el.options).find((option) => option.value === value);
+                const byText = Array.from(el.options).find((option) =>
+                    option.textContent.trim().toLowerCase() === value.toLowerCase()
+                );
+                const option = exact || byText;
+                if (!option) {{
+                    return JSON.stringify({{
+                        filled: false,
+                        refId,
+                        reason: "no matching select option"
+                    }});
+                }}
+                el.value = option.value;
+            }} else if ("value" in el) {{
+                el.value = value;
+            }} else if (el.isContentEditable) {{
+                el.textContent = value;
+            }} else {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "element cannot receive text"
+                }});
+            }}
+            el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return JSON.stringify({{
+                filled: true,
+                refId,
+                tag: el.tagName.toLowerCase()
+            }});
+        }})()"##
+    );
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    let details: Value = serde_json::from_str(&value_to_string(raw))?;
+    if details
+        .get("filled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(details)
+    } else {
+        bail!(
+            "{}",
+            details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("fillPaymentRefs failed")
+        )
+    }
+}
+
 fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
     let css_json = serde_json::to_string(css)?;
     let js = format!(
@@ -452,7 +572,7 @@ fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaymentVault, is_sensitive_submit, parse_field_ref};
+    use super::{PaymentFieldMapping, PaymentVault, is_sensitive_submit, parse_field_ref};
     use std::fs;
 
     #[test]
@@ -480,6 +600,14 @@ mod tests {
     fn parses_field_refs() {
         assert_eq!(parse_field_ref("default:cvc").unwrap(), ("default", "cvc"));
         assert_eq!(parse_field_ref("cvc").unwrap(), ("default", "cvc"));
+    }
+
+    #[test]
+    fn parses_payment_field_mapping_refs() {
+        let mapping: PaymentFieldMapping =
+            serde_json::from_str(r#"{"refId":"e4","field":"default:card_number"}"#).unwrap();
+        assert_eq!(mapping.ref_id, "e4");
+        assert_eq!(mapping.field, "default:card_number");
     }
 
     #[test]
