@@ -1,0 +1,6 @@
+{
+  "actions": [
+    { "op": "navigate", "url": "https://example.com" },
+    { "op": "title" }
+  ]
+}

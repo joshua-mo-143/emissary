@@ -1,3 +1,10 @@
+/.env
 /target/
 /automation-profile/
+/automation-profile-run/
 /.agent-runtime/
+/.agent-runtime/payment.json
+/.agent-runtime/daemon.lock
+
+.envrc
+.env*
