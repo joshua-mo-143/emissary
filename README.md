@@ -1,6 +1,6 @@
-# Telephone
+# Emissary
 
-Telephone is a minimal assistant harness with a built-in browser-use tool. One command starts the LLM chat and the headed Chrome daemon together, and stopping Telephone tears everything down.
+Emissary is a minimal assistant harness with a built-in browser-use tool. One command starts the LLM chat and the headed Chrome daemon together, and stopping Emissary tears everything down.
 
 Cookies and login state persist in `automation-profile/`.
 
@@ -15,7 +15,7 @@ cargo run -- chat
        └─ shutdown on exit / Ctrl+C
 ```
 
-There is no separate long-lived `serve` step. The browser daemon lifetime matches the Telephone session.
+There is no separate long-lived `serve` step. The browser daemon lifetime matches the Emissary session.
 
 ## Quick start
 
@@ -26,9 +26,9 @@ export VENICE_API_KEY=...
 cargo run -- chat
 ```
 
-Telephone auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
+Emissary auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
 
-On first run, Telephone creates `.agent-runtime/payment.json` with a starter `default` profile (Stripe-style test placeholders). Edit it with your real card details before checkout. The file is created with mode `600`.
+On first run, Emissary creates `.agent-runtime/payment.json` with a starter `default` profile (Stripe-style test placeholders). Edit it with your real card details before checkout. The file is created with mode `600`.
 
 To seed manually instead:
 
@@ -54,7 +54,7 @@ cargo run -- stop
 | `VENICE_BASE_URL` | `https://api.venice.ai/api/v1` | Venice API base URL |
 | `VENICE_MODEL` | `deepseek-v4-flash` | chat model |
 | `VENICE_TIMEOUT_SECS` | `300` | total timeout for each Venice chat completion request |
-| `TELEPHONE_RUNTIME_DIR` | `.agent-runtime` | lock file + review screenshots |
+| `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file + review screenshots |
 | `PAYMENT_FILE` | `.agent-runtime/payment.json` | payment vault |
 | `CHROME` | auto-detect | Chromium/Chrome binary path |
 | `IDLE_BROWSER_TIMEOUT_SECS` | `3600` | CDP idle timeout; headless_chrome defaults to 30s, which breaks chat while waiting on the LLM |
@@ -96,7 +96,7 @@ cargo run -- run examples/checkout.json
 When checkout needs you:
 
 - **`mode: review`** — order summary + basket screenshot in terminal; open `handoff_url` only to submit
-- **`mode: interactive`** — bank/app auth (e.g. Lloyds); use `handoff_url`, then tell Telephone you're done so it sends `{ "op": "resume" }`
+- **`mode: interactive`** — bank/app auth (e.g. Lloyds); use `handoff_url`, then tell Emissary you're done so it sends `{ "op": "resume" }`
 
 Payment secrets stay in the vault. Wrong card details are tolerable; blocked submits and bank 2FA are not.
 

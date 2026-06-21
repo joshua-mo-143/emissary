@@ -1,6 +1,6 @@
-# Telephone — agent guide
+# Emissary — agent guide
 
-Telephone is a minimal Rust assistant harness with a browser-use tool. One binary runs the LLM chat loop and a managed headed Chrome stack (Xvfb, noVNC, websockify, Chromium). The browser session, payment vault, guardrails, and human handoff logic live in-process — not in a separate long-lived daemon the user must babysit.
+Emissary is a minimal Rust assistant harness with a browser-use tool. One binary runs the LLM chat loop and a managed headed Chrome stack (Xvfb, noVNC, websockify, Chromium). The browser session, payment vault, guardrails, and human handoff logic live in-process — not in a separate long-lived daemon the user must babysit.
 
 ## Layout
 
@@ -38,7 +38,7 @@ Runtime data (gitignored):
 | `VENICE_MODEL` | no | `deepseek-v4-flash` |
 | `CHROME` | no | auto-detect Chromium |
 | `PAYMENT_FILE` | no | `.agent-runtime/payment.json` |
-| `TELEPHONE_RUNTIME_DIR` | no | `.agent-runtime` |
+| `EMISSARY_RUNTIME_DIR` | no | `.agent-runtime` |
 
 Venice is OpenAI-compatible; the harness calls `/chat/completions` with tool calling.
 
@@ -100,7 +100,7 @@ Follow these conventions when editing this repo.
 
 **Add a browser action:** extend `Action` in `actions.rs`, handle it in `execute_action`, update `tool_schema()`, README, and this file.
 
-**Browser interaction style:** prefer `observe` -> `clickRef` / `typeRef` for normal browsing. `observe` assigns stable `data-telephone-ref` IDs to visible controls and returns them as `elements`, which avoids brittle model-invented CSS selectors. Keep direct `click` / `type` for simple known selectors or tests.
+**Browser interaction style:** prefer `observe` -> `clickRef` / `typeRef` for normal browsing. `observe` assigns stable `data-emissary-ref` IDs to visible controls and returns them as `elements`, which avoids brittle model-invented CSS selectors. Keep direct `click` / `type` for simple known selectors or tests.
 
 **Change LLM provider:** edit `LlmConfig` in `harness.rs`; keep OpenAI-compatible chat completions + tools unless the provider requires otherwise.
 

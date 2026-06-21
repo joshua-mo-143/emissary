@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const DUCKDUCKGO_API: &str = "https://api.duckduckgo.com/";
 
-pub fn duckduckgo_instant_answer(query: &str) -> Result<Value> {
+pub fn duckduckgo_instant_answer(query: &str) -> Result<DuckDuckGoSearchResult> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("telephone-agent/0.1 (+https://github.com/joshua-mo-143)")
+        .user_agent("emissary-agent/0.1 (+https://github.com/joshua-mo-143)")
         .build()
         .context("failed to build DuckDuckGo HTTP client")?;
 
-    let payload: Value = client
+    let payload: DuckDuckGoResponse = client
         .get(DUCKDUCKGO_API)
         .query(&[
             ("q", query),
@@ -27,104 +27,161 @@ pub fn duckduckgo_instant_answer(query: &str) -> Result<Value> {
         .json()
         .context("DuckDuckGo returned invalid JSON")?;
 
-    Ok(compact_instant_answer(query, &payload))
+    Ok(DuckDuckGoSearchResult::from_response(query, payload))
 }
 
-fn compact_instant_answer(query: &str, payload: &Value) -> Value {
-    json!({
-        "provider": "duckduckgo_instant_answer",
-        "query": query,
-        "heading": string_field(payload, "Heading"),
-        "answer": string_field(payload, "Answer"),
-        "abstract": string_field(payload, "AbstractText"),
-        "abstractUrl": string_field(payload, "AbstractURL"),
-        "definition": string_field(payload, "Definition"),
-        "definitionUrl": string_field(payload, "DefinitionURL"),
-        "type": string_field(payload, "Type"),
-        "results": result_items(payload.get("Results")),
-        "related": related_topics(payload.get("RelatedTopics"), 8),
-    })
+#[derive(Debug, Deserialize)]
+struct DuckDuckGoResponse {
+    #[serde(rename = "Heading", default)]
+    heading: String,
+    #[serde(rename = "Answer", default)]
+    answer: String,
+    #[serde(rename = "AbstractText", default)]
+    abstract_text: String,
+    #[serde(rename = "AbstractURL", default)]
+    abstract_url: String,
+    #[serde(rename = "Definition", default)]
+    definition: String,
+    #[serde(rename = "DefinitionURL", default)]
+    definition_url: String,
+    #[serde(rename = "Type", default)]
+    type_field: String,
+    #[serde(rename = "Results", default)]
+    results: Vec<DuckDuckGoTopic>,
+    #[serde(rename = "RelatedTopics", default)]
+    related_topics: Vec<DuckDuckGoTopic>,
 }
 
-fn string_field(payload: &Value, key: &str) -> Option<String> {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
+#[derive(Debug, Deserialize)]
+struct DuckDuckGoTopic {
+    #[serde(rename = "Text", default)]
+    text: String,
+    #[serde(rename = "FirstURL", default)]
+    first_url: String,
+    #[serde(rename = "Topics", default)]
+    topics: Vec<DuckDuckGoTopic>,
 }
 
-fn result_items(value: Option<&Value>) -> Vec<Value> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(topic_item)
-        .take(5)
-        .collect()
+#[derive(Debug, Serialize)]
+pub struct DuckDuckGoSearchResult {
+    pub provider: &'static str,
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(rename = "abstract", skip_serializing_if = "Option::is_none")]
+    pub abstract_text: Option<String>,
+    #[serde(rename = "abstractUrl", skip_serializing_if = "Option::is_none")]
+    pub abstract_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+    #[serde(rename = "definitionUrl", skip_serializing_if = "Option::is_none")]
+    pub definition_url: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_field: Option<String>,
+    pub results: Vec<SearchTopic>,
+    pub related: Vec<SearchTopic>,
 }
 
-fn related_topics(value: Option<&Value>, limit: usize) -> Vec<Value> {
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SearchTopic {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl DuckDuckGoSearchResult {
+    fn from_response(query: &str, response: DuckDuckGoResponse) -> Self {
+        Self {
+            provider: "duckduckgo_instant_answer",
+            query: query.to_owned(),
+            heading: non_empty(response.heading),
+            answer: non_empty(response.answer),
+            abstract_text: non_empty(response.abstract_text),
+            abstract_url: non_empty(response.abstract_url),
+            definition: non_empty(response.definition),
+            definition_url: non_empty(response.definition_url),
+            type_field: non_empty(response.type_field),
+            results: response
+                .results
+                .iter()
+                .filter_map(SearchTopic::from_ddg_topic)
+                .take(5)
+                .collect(),
+            related: related_topics(&response.related_topics, 8),
+        }
+    }
+}
+
+impl SearchTopic {
+    fn from_ddg_topic(topic: &DuckDuckGoTopic) -> Option<Self> {
+        let text = non_empty(topic.text.clone())?;
+        Some(Self {
+            text,
+            url: non_empty(topic.first_url.clone()),
+        })
+    }
+}
+
+fn related_topics(topics: &[DuckDuckGoTopic], limit: usize) -> Vec<SearchTopic> {
     let mut out = Vec::new();
-    collect_topics(value, &mut out, limit);
+    collect_topics(topics, &mut out, limit);
     out
 }
 
-fn collect_topics(value: Option<&Value>, out: &mut Vec<Value>, limit: usize) {
+fn collect_topics(topics: &[DuckDuckGoTopic], out: &mut Vec<SearchTopic>, limit: usize) {
     if out.len() >= limit {
         return;
     }
-    let Some(items) = value.and_then(Value::as_array) else {
-        return;
-    };
 
-    for item in items {
+    for topic in topics {
         if out.len() >= limit {
             break;
         }
-        if let Some(topic) = topic_item(item) {
-            out.push(topic);
-        } else if let Some(nested) = item.get("Topics") {
-            collect_topics(Some(nested), out, limit);
+        if let Some(item) = SearchTopic::from_ddg_topic(topic) {
+            out.push(item);
+        }
+        if !topic.topics.is_empty() {
+            collect_topics(&topic.topics, out, limit);
         }
     }
 }
 
-fn topic_item(item: &Value) -> Option<Value> {
-    let text = item
-        .get("Text")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?;
-    Some(json!({
-        "text": text,
-        "url": item.get("FirstURL").and_then(Value::as_str),
-    }))
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compact_instant_answer;
-    use serde_json::json;
+    use super::{DuckDuckGoResponse, DuckDuckGoSearchResult};
 
     #[test]
     fn compacts_nested_related_topics() {
-        let payload = json!({
-            "Heading": "Rust",
-            "AbstractText": "Rust is a programming language.",
-            "AbstractURL": "https://example.com/rust",
-            "RelatedTopics": [
-                { "Text": "Rust - language", "FirstURL": "https://example.com/1" },
-                {
-                    "Name": "Nested",
-                    "Topics": [
-                        { "Text": "Cargo - build tool", "FirstURL": "https://example.com/2" }
-                    ]
-                }
-            ]
-        });
+        let payload: DuckDuckGoResponse = serde_json::from_str(
+            r#"{
+                "Heading": "Rust",
+                "AbstractText": "Rust is a programming language.",
+                "AbstractURL": "https://example.com/rust",
+                "RelatedTopics": [
+                    { "Text": "Rust - language", "FirstURL": "https://example.com/1" },
+                    {
+                        "Name": "Nested",
+                        "Topics": [
+                            { "Text": "Cargo - build tool", "FirstURL": "https://example.com/2" }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
 
-        let compact = compact_instant_answer("rust", &payload);
-        assert_eq!(compact["heading"], "Rust");
-        assert_eq!(compact["related"].as_array().unwrap().len(), 2);
+        let compact = DuckDuckGoSearchResult::from_response("rust", payload);
+        assert_eq!(compact.heading.as_deref(), Some("Rust"));
+        assert_eq!(compact.related.len(), 2);
     }
 }

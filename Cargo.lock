@@ -299,6 +299,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "emissary-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ctrlc",
+ "headless_chrome",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiny_http",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1261,20 +1275,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "telephone-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "ctrlc",
- "headless_chrome",
- "reqwest",
- "serde",
- "serde_json",
- "tiny_http",
 ]
 
 [[package]]

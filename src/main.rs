@@ -72,7 +72,7 @@ fn usage() -> &'static str {
   cargo run -- run [request.json]
   cargo run -- request.json
 
-  chat    start Telephone and the browser daemon together
+  chat    start Emissary and the browser daemon together
   stop    clean up a stale daemon lock/processes
   run     execute JSON browser actions once (separate headless session)
 

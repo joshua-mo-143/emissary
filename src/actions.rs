@@ -1,5 +1,5 @@
 use crate::payment::{PaymentVault, block_type_on_payment_field, is_sensitive_submit};
-use crate::review::{self, capture_order_review};
+use crate::review::{self, HandoffPayload, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
 use headless_chrome::Tab;
@@ -73,6 +73,11 @@ pub struct RunRequest {
     pub actions: Vec<Action>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BrowserToolArguments {
+    pub actions: Vec<Action>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunSuccess {
     pub status: &'static str,
@@ -117,7 +122,7 @@ pub enum RunOutcome {
     NeedsHuman {
         completed: usize,
         results: Vec<ActionResult>,
-        handoff: Value,
+        handoff: HandoffPayload,
     },
 }
 
@@ -143,7 +148,7 @@ pub struct RunContext<'a> {
 pub fn tool_schema() -> Value {
     json!({
         "name": "browser",
-        "description": "Browser-use tool for the Telephone harness. Controls a persistent local Chrome session, with payment vault injection, basket review screenshots, and human handoff for final submits or bank 2FA.",
+        "description": "Browser-use tool for the Emissary harness. Controls a persistent local Chrome session, with payment vault injection, basket review screenshots, and human handoff for final submits or bank 2FA.",
         "parameters": {
             "type": "object",
             "required": ["actions"],
@@ -293,7 +298,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
 fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value> {
     let tab = context.tab.as_ref();
     match action {
-        Action::WebSearch { query } => duckduckgo_instant_answer(query),
+        Action::WebSearch { query } => Ok(json!(duckduckgo_instant_answer(query)?)),
         Action::Navigate { url } => {
             tab.navigate_to(url)?;
             let wait_result = tab.wait_until_navigated();
@@ -366,7 +371,7 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
         }
-        Action::Review => capture_order_review(tab),
+        Action::Review => Ok(json!(capture_order_review(tab)?)),
         Action::Handoff => {
             if let Some(paused) = context.paused.as_deref_mut() {
                 *paused = true;
@@ -556,7 +561,7 @@ fn current_page_snapshot(tab: &Tab) -> PageSnapshot {
 
 fn observe_elements(tab: &Tab) -> Result<Vec<ElementRef>> {
     let js = r##"(() => {
-        let nextId = Number(document.documentElement.dataset.telephoneNextRef || "1");
+        let nextId = Number(document.documentElement.dataset.emissaryNextRef || "1");
         const selector = [
             "button",
             "a[href]",
@@ -614,18 +619,18 @@ fn observe_elements(tab: &Tab) -> Result<Vec<ElementRef>> {
             const label = textFor(el);
             const kind = kindFor(el);
             if (!label && kind !== "input" && kind !== "select") continue;
-            if (!el.dataset.telephoneRef) {
-                el.dataset.telephoneRef = `e${nextId++}`;
+            if (!el.dataset.emissaryRef) {
+                el.dataset.emissaryRef = `e${nextId++}`;
             }
             out.push({
-                ref: el.dataset.telephoneRef,
+                ref: el.dataset.emissaryRef,
                 kind,
                 label: (label || `${el.tagName.toLowerCase()} ${el.name || el.id || ""}`).slice(0, 180),
                 tag: el.tagName.toLowerCase()
             });
             if (out.length >= 80) break;
         }
-        document.documentElement.dataset.telephoneNextRef = String(nextId);
+        document.documentElement.dataset.emissaryNextRef = String(nextId);
         return JSON.stringify(out);
     })()"##;
 
@@ -638,8 +643,8 @@ fn element_ref_details(tab: &Tab, ref_id: &str) -> Result<String> {
     let js = format!(
         r##"(() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-telephone-ref]"))
-                .find((candidate) => candidate.dataset.telephoneRef === refId);
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return "";
             const form = el.closest("form");
             return [
@@ -668,8 +673,8 @@ fn click_by_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
     let js = format!(
         r##"(() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-telephone-ref]"))
-                .find((candidate) => candidate.dataset.telephoneRef === refId);
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return JSON.stringify({{ clicked: false, ref: refId, reason: "unknown element ref; call observe again" }});
             el.scrollIntoView({{ block: "center", inline: "center" }});
             el.click();
@@ -708,8 +713,8 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
         r##"(() => {{
             const refId = {ref_json};
             const text = {text_json};
-            const el = Array.from(document.querySelectorAll("[data-telephone-ref]"))
-                .find((candidate) => candidate.dataset.telephoneRef === refId);
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return JSON.stringify({{ typed: false, ref: refId, reason: "unknown element ref; call observe again" }});
             el.scrollIntoView({{ block: "center", inline: "center" }});
             el.focus();
@@ -744,8 +749,8 @@ fn element_ref_is_payment_field(tab: &Tab, ref_id: &str) -> Result<bool> {
     let js = format!(
         r##"(() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-telephone-ref]"))
-                .find((candidate) => candidate.dataset.telephoneRef === refId);
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return false;
             const hay = [
                 el.getAttribute("autocomplete"),
@@ -833,8 +838,9 @@ pub fn outcome_to_json(outcome: RunOutcome) -> Value {
         RunOutcome::NeedsHuman {
             completed,
             results,
-            mut handoff,
+            handoff,
         } => {
+            let mut handoff = serde_json::to_value(handoff).unwrap_or(Value::Null);
             if let Some(object) = handoff.as_object_mut() {
                 object.insert("completed".to_owned(), json!(completed));
                 object.insert(

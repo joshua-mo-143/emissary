@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use headless_chrome::{Tab, protocol::cdp::Page::CaptureScreenshotFormatOption};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 
 const AUTH_CHALLENGE: &str = "auth challenge detected:";
 const BOT_CHALLENGE: &str = "bot challenge detected:";
@@ -60,6 +61,45 @@ const PAYMENT_LINE_PATTERNS: &[&str] = &[
     "credit card",
     "billing address",
 ];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffPayload {
+    pub status: &'static str,
+    pub mode: HandoffMode,
+    pub reason: String,
+    pub session_id: String,
+    pub handoff_url: String,
+    pub resume: &'static str,
+    #[serde(rename = "pageState", skip_serializing_if = "Option::is_none")]
+    pub page_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<OrderReview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffMode {
+    Review,
+    Interactive,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderReview {
+    pub review_scope: &'static str,
+    pub order_summary: Option<String>,
+    pub screenshot_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_mime: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+}
 
 pub fn auth_challenge_prefix() -> &'static str {
     AUTH_CHALLENGE
@@ -148,31 +188,33 @@ pub fn is_auth_challenge_text(text: &str) -> bool {
             && (lower.contains("enter") || lower.contains("code") || lower.contains("sent"))
 }
 
-pub fn capture_order_review(tab: &Tab) -> Result<Value> {
+pub fn capture_order_review(tab: &Tab) -> Result<OrderReview> {
     if page_needs_interactive_auth(tab)? {
         bail!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url");
     }
 
     let target = find_order_review_target(tab)?;
     let Some(target) = target else {
-        return Ok(json!({
-            "review_scope": "order_summary",
-            "order_summary": Value::Null,
-            "screenshot_base64": Value::Null,
-            "review_note": "could not locate basket or order summary on page",
-        }));
+        return Ok(OrderReview {
+            review_scope: "order_summary",
+            order_summary: None,
+            screenshot_base64: None,
+            screenshot_mime: None,
+            review_note: Some("could not locate basket or order summary on page".to_owned()),
+        });
     };
 
     let summary = sanitize_summary_text(&target.summary);
     let screenshot_base64 = capture_target_screenshot(tab, &target.selector)?;
     clear_review_target(tab)?;
 
-    Ok(json!({
-        "review_scope": "order_summary",
-        "order_summary": summary,
-        "screenshot_base64": screenshot_base64,
-        "screenshot_mime": "image/png",
-    }))
+    Ok(OrderReview {
+        review_scope: "order_summary",
+        order_summary: Some(summary),
+        screenshot_base64: Some(screenshot_base64),
+        screenshot_mime: Some("image/png"),
+        review_note: None,
+    })
 }
 
 pub fn handoff_payload(
@@ -180,72 +222,98 @@ pub fn handoff_payload(
     session_id: &str,
     handoff_url: &str,
     reason: impl Into<String>,
-) -> Value {
+) -> HandoffPayload {
     let reason = reason.into();
 
     if page_needs_bot_challenge(tab).unwrap_or(false) {
-        return json!({
-            "status": "needs_human",
-            "mode": "blocked",
-            "reason": format!("{BOT_CHALLENGE} Cloudflare is blocking the automated browser. If the challenge does not fully load in handoff, use a normal browser or choose another site."),
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-            "pageState": "bot_challenge",
-            "retry": false,
-            "guidance": "Do not keep retrying automation on this page. Ask the user whether to use another food site, continue manually in their normal browser, or try again after they pass Cloudflare outside the harness.",
-        });
+        return HandoffPayload::blocked(
+            session_id,
+            handoff_url,
+            format!(
+                "{BOT_CHALLENGE} Cloudflare is blocking the automated browser. If the challenge does not fully load in handoff, use a normal browser or choose another site."
+            ),
+        );
     }
 
     if page_needs_interactive_auth(tab).unwrap_or(false) {
-        return json!({
-            "status": "needs_human",
-            "mode": "interactive",
-            "reason": format!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url"),
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-        });
+        return HandoffPayload::interactive(
+            session_id,
+            handoff_url,
+            format!("{AUTH_CHALLENGE} complete bank or app authentication via handoff_url"),
+        );
     }
 
     match capture_order_review(tab) {
-        Ok(review) => json!({
-            "status": "needs_human",
-            "mode": "review",
-            "reason": reason,
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-            "review": review,
-        }),
-        Err(error) if error.to_string().starts_with(AUTH_CHALLENGE) => json!({
-            "status": "needs_human",
-            "mode": "interactive",
-            "reason": error.to_string(),
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-        }),
-        Err(error) if error.to_string().starts_with(BOT_CHALLENGE) => json!({
-            "status": "needs_human",
-            "mode": "blocked",
-            "reason": error.to_string(),
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-            "pageState": "bot_challenge",
-            "retry": false,
-            "guidance": "Do not keep retrying automation on this page. Ask the user whether to use another food site, continue manually in their normal browser, or try again after they pass Cloudflare outside the harness.",
-        }),
-        Err(error) => json!({
-            "status": "needs_human",
-            "mode": "review",
-            "reason": reason,
-            "session_id": session_id,
-            "handoff_url": handoff_url,
-            "resume": "POST /resume",
-            "review_error": error.to_string(),
-        }),
+        Ok(review) => HandoffPayload::review(session_id, handoff_url, reason, Some(review), None),
+        Err(error) if error.to_string().starts_with(AUTH_CHALLENGE) => {
+            HandoffPayload::interactive(session_id, handoff_url, error.to_string())
+        }
+        Err(error) if error.to_string().starts_with(BOT_CHALLENGE) => {
+            HandoffPayload::blocked(session_id, handoff_url, error.to_string())
+        }
+        Err(error) => HandoffPayload::review(
+            session_id,
+            handoff_url,
+            reason,
+            None,
+            Some(error.to_string()),
+        ),
+    }
+}
+
+impl HandoffPayload {
+    fn review(
+        session_id: &str,
+        handoff_url: &str,
+        reason: String,
+        review: Option<OrderReview>,
+        review_error: Option<String>,
+    ) -> Self {
+        Self {
+            status: "needs_human",
+            mode: HandoffMode::Review,
+            reason,
+            session_id: session_id.to_owned(),
+            handoff_url: handoff_url.to_owned(),
+            resume: "POST /resume",
+            page_state: None,
+            retry: None,
+            guidance: None,
+            review,
+            review_error,
+        }
+    }
+
+    fn interactive(session_id: &str, handoff_url: &str, reason: String) -> Self {
+        Self {
+            status: "needs_human",
+            mode: HandoffMode::Interactive,
+            reason,
+            session_id: session_id.to_owned(),
+            handoff_url: handoff_url.to_owned(),
+            resume: "POST /resume",
+            page_state: None,
+            retry: None,
+            guidance: None,
+            review: None,
+            review_error: None,
+        }
+    }
+
+    fn blocked(session_id: &str, handoff_url: &str, reason: String) -> Self {
+        Self {
+            status: "needs_human",
+            mode: HandoffMode::Blocked,
+            reason,
+            session_id: session_id.to_owned(),
+            handoff_url: handoff_url.to_owned(),
+            resume: "POST /resume",
+            page_state: Some("bot_challenge".to_owned()),
+            retry: Some(false),
+            guidance: Some("Do not keep retrying automation on this page. Ask the user whether to use another food site, continue manually in their normal browser, or try again after they pass Cloudflare outside the harness.".to_owned()),
+            review: None,
+            review_error: None,
+        }
     }
 }
 
@@ -287,9 +355,9 @@ fn find_order_review_target(tab: &Tab) -> Result<Option<ReviewTarget>> {
 
         if (!best) return null;
 
-        best.setAttribute("data-telephone-review-target", "1");
+        best.setAttribute("data-emissary-review-target", "1");
         return {
-            selector: '[data-telephone-review-target="1"]',
+            selector: '[data-emissary-review-target="1"]',
             summary: best.innerText.slice(0, 4000),
         };
     })()"#;
@@ -316,20 +384,20 @@ fn find_order_review_target(tab: &Tab) -> Result<Option<ReviewTarget>> {
     Ok(Some(ReviewTarget { selector, summary }))
 }
 
-fn capture_target_screenshot(tab: &Tab, selector: &str) -> Result<Value> {
+fn capture_target_screenshot(tab: &Tab, selector: &str) -> Result<String> {
     let png = tab
         .wait_for_element(selector)
         .with_context(|| format!("review target `{selector}` disappeared"))?
         .capture_screenshot(CaptureScreenshotFormatOption::Png)
         .context("failed to capture order review screenshot")?;
-    Ok(Value::String(BASE64.encode(png)))
+    Ok(BASE64.encode(png))
 }
 
 fn clear_review_target(tab: &Tab) -> Result<()> {
     let _ = tab.evaluate(
         r#"(() => {
-            const el = document.querySelector('[data-telephone-review-target="1"]');
-            if (el) el.removeAttribute('data-telephone-review-target');
+            const el = document.querySelector('[data-emissary-review-target="1"]');
+            if (el) el.removeAttribute('data-emissary-review-target');
             return true;
         })()"#,
         false,
@@ -355,7 +423,9 @@ fn is_payment_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_challenge_text, is_bot_challenge_text, sanitize_summary_text};
+    use super::{
+        HandoffPayload, is_auth_challenge_text, is_bot_challenge_text, sanitize_summary_text,
+    };
 
     #[test]
     fn detects_cloudflare_challenge_pages() {
@@ -398,5 +468,19 @@ mod tests {
         assert!(summary.contains("Subtotal"));
         assert!(summary.contains("Total"));
         assert!(!summary.contains("Card number"));
+    }
+
+    #[test]
+    fn serializes_blocked_handoff_shape() {
+        let payload = HandoffPayload::blocked(
+            "session",
+            "http://127.0.0.1:6080",
+            "bot challenge detected: blocked".to_owned(),
+        );
+        let value = serde_json::to_value(payload).unwrap();
+        assert_eq!(value["status"], "needs_human");
+        assert_eq!(value["mode"], "blocked");
+        assert_eq!(value["pageState"], "bot_challenge");
+        assert_eq!(value["retry"], false);
     }
 }

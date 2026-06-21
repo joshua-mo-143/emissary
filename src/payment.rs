@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn creates_default_payment_file_when_missing() {
         let dir = std::env::temp_dir().join(format!(
-            "telephone-payment-create-test-{}",
+            "emissary-payment-create-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn loads_payment_profiles_from_json() {
         let dir =
-            std::env::temp_dir().join(format!("telephone-payment-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("emissary-payment-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("payment.json");

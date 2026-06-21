@@ -25,6 +25,64 @@ pub struct ManagedDaemon {
     lock_path: PathBuf,
 }
 
+pub struct BrowserResponse {
+    status: u16,
+    kind: BrowserResponseKind,
+    body: Value,
+}
+
+enum BrowserResponseKind {
+    Success,
+    Error,
+    NeedsHuman,
+}
+
+impl BrowserResponse {
+    fn success(body: Value) -> Self {
+        Self {
+            status: 200,
+            kind: BrowserResponseKind::Success,
+            body,
+        }
+    }
+
+    fn error(body: Value) -> Self {
+        Self {
+            status: 200,
+            kind: BrowserResponseKind::Error,
+            body,
+        }
+    }
+
+    fn needs_human(body: Value) -> Self {
+        Self {
+            status: 409,
+            kind: BrowserResponseKind::NeedsHuman,
+            body,
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body(&self) -> &Value {
+        &self.body
+    }
+
+    pub fn into_body(self) -> Value {
+        self.body
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self.kind, BrowserResponseKind::Error)
+    }
+
+    pub fn needs_human_handoff(&self) -> bool {
+        matches!(self.kind, BrowserResponseKind::NeedsHuman)
+    }
+}
+
 impl ManagedDaemon {
     pub fn start() -> Result<Self> {
         let runtime_dir = runtime_dir()?;
@@ -136,12 +194,12 @@ impl ManagedDaemon {
         let had_lock = runtime_dir.join(LOCK_FILE).exists();
         reclaim_stale_daemon(&runtime_dir)?;
         if runtime_dir.join(LOCK_FILE).exists() {
-            bail!("Telephone daemon is still running");
+            bail!("Emissary daemon is still running");
         }
         if had_lock {
-            println!("stale Telephone daemon cleaned up");
+            println!("stale Emissary daemon cleaned up");
         } else {
-            println!("no Telephone daemon running");
+            println!("no Emissary daemon running");
         }
         Ok(())
     }
@@ -162,11 +220,11 @@ impl ManagedDaemon {
         self.runtime().payment.keys()
     }
 
-    pub fn run(&mut self, actions: Vec<Action>) -> Result<(u16, Value)> {
+    pub fn run(&mut self, actions: Vec<Action>) -> Result<BrowserResponse> {
         let runtime = self
             .runtime
             .as_mut()
-            .context("Telephone daemon is not running")?;
+            .context("Emissary daemon is not running")?;
         let run_request = RunRequest { actions };
         if runtime.paused
             && !run_request
@@ -174,15 +232,12 @@ impl ManagedDaemon {
                 .iter()
                 .all(|action| matches!(action, Action::Resume))
         {
-            return Ok((
-                409,
-                handoff_payload(
-                    &runtime.tab,
-                    &runtime.session_id,
-                    &runtime.handoff_url,
-                    "human handoff is active",
-                ),
-            ));
+            return Ok(BrowserResponse::needs_human(json!(handoff_payload(
+                &runtime.tab,
+                &runtime.session_id,
+                &runtime.handoff_url,
+                "human handoff is active",
+            ))));
         }
 
         let mut context = RunContext {
@@ -194,21 +249,23 @@ impl ManagedDaemon {
         };
 
         match run_actions(&mut context, &run_request)? {
-            RunOutcome::Success(success) => Ok((200, json!(success))),
-            RunOutcome::Failed(failure) => Ok((200, json!(failure))),
-            RunOutcome::NeedsHuman { handoff, .. } => Ok((409, handoff)),
+            RunOutcome::Success(success) => Ok(BrowserResponse::success(json!(success))),
+            RunOutcome::Failed(failure) => Ok(BrowserResponse::error(json!(failure))),
+            RunOutcome::NeedsHuman { handoff, .. } => {
+                Ok(BrowserResponse::needs_human(json!(handoff)))
+            }
         }
     }
 
     pub fn handoff(&mut self, reason: &str) -> Value {
         let runtime = self.runtime.as_mut().expect("daemon running");
         runtime.paused = true;
-        handoff_payload(
+        json!(handoff_payload(
             &runtime.tab,
             &runtime.session_id,
             &runtime.handoff_url,
             reason,
-        )
+        ))
     }
 
     pub fn resume(&mut self) {
@@ -225,7 +282,7 @@ impl ManagedDaemon {
     fn runtime(&self) -> &Runtime {
         self.runtime
             .as_ref()
-            .expect("Telephone daemon is not running")
+            .expect("Emissary daemon is not running")
     }
 }
 
@@ -252,14 +309,14 @@ fn reclaim_stale_daemon(runtime_dir: &Path) -> Result<()> {
     let lock = read_lock(&lock_path)?;
     if process_alive(lock.owner_pid) {
         bail!(
-            "Telephone daemon already running (pid {} on {})",
+            "Emissary daemon already running (pid {} on {})",
             lock.owner_pid,
             lock.api_addr
         );
     }
 
     eprintln!(
-        "cleaning stale Telephone daemon (pid {}, started {})",
+        "cleaning stale Emissary daemon (pid {}, started {})",
         lock.owner_pid, lock.started_at
     );
     for pid in lock.child_pids {
@@ -308,7 +365,7 @@ pub fn install_shutdown_handler(daemon: Arc<std::sync::Mutex<ManagedDaemon>>) ->
         if let Ok(mut guard) = daemon.lock() {
             guard.shutdown();
         }
-        let _ = writeln!(io::stderr(), "\nTelephone stopped.");
+        let _ = writeln!(io::stderr(), "\nEmissary stopped.");
         std::process::exit(0);
     })?;
     Ok(())
@@ -525,7 +582,7 @@ fn automation_profile() -> Result<PathBuf> {
 }
 
 pub fn runtime_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("TELEPHONE_RUNTIME_DIR") {
+    if let Ok(dir) = std::env::var("EMISSARY_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir));
     }
     Ok(std::env::current_dir()?.join(RUNTIME_DIR))
@@ -646,8 +703,8 @@ fn handle_request(mut request: Request, daemon: &mut ManagedDaemon) -> Result<()
         (Method::Post, "/run") | (Method::Post, "/task") => {
             let body = read_request_body(&mut request)?;
             let run_request = parse_run_request(&body)?;
-            let (status, body) = daemon.run(run_request.actions)?;
-            json_response(StatusCode(status), body)
+            let response = daemon.run(run_request.actions)?;
+            json_response(StatusCode(response.status()), response.into_body())
         }
         _ => json_response(
             StatusCode(404),

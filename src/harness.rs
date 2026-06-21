@@ -1,8 +1,9 @@
-use crate::actions::Action;
+use crate::actions::{Action, BrowserToolArguments};
 use crate::daemon::{ManagedDaemon, install_shutdown_handler, runtime_dir};
 use crate::payment::PaymentVault;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     fs,
@@ -20,7 +21,7 @@ pub fn chat() -> Result<()> {
     let daemon = ManagedDaemon::start()?;
     let status = daemon.status();
     println!(
-        "Telephone started (session {}, handoff on demand)",
+        "Emissary started (session {}, handoff on demand)",
         status
             .get("session_id")
             .and_then(Value::as_str)
@@ -45,10 +46,7 @@ pub fn chat() -> Result<()> {
         );
     }
 
-    let mut messages = vec![json!({
-        "role": "system",
-        "content": system_prompt(&payment_keys, &status),
-    })];
+    let mut messages = vec![ChatMessage::system(system_prompt(&payment_keys, &status))];
     let tool = openai_tool(&schema);
     println!("Type a message, or 'exit' to quit.\n");
 
@@ -67,14 +65,14 @@ pub fn chat() -> Result<()> {
             break;
         }
 
-        messages.push(json!({ "role": "user", "content": line }));
+        messages.push(ChatMessage::user(line));
         let reply = run_agent_turn(&shared, &llm, &tool, &mut messages, &runtime_dir)?;
         messages.push(reply.message);
         println!("\nassistant> {}\n", reply.text);
     }
 
     shared.lock().expect("daemon mutex poisoned").shutdown();
-    println!("Telephone stopped.");
+    println!("Emissary stopped.");
     Ok(())
 }
 
@@ -83,6 +81,96 @@ struct LlmConfig {
     base_url: String,
     model: String,
     http: reqwest::blocking::Client,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_owned(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_owned(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_text(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_owned(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_owned(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    fn content_text(&self) -> &str {
+        self.content.as_deref().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCall {
+    id: String,
+    #[serde(default)]
+    r#type: Option<String>,
+    function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
 }
 
 impl LlmConfig {
@@ -102,14 +190,13 @@ impl LlmConfig {
         })
     }
 
-    fn complete(&self, messages: &[Value], tools: &[Value]) -> Result<Value> {
-        let mut request = Map::new();
-        request.insert("model".to_owned(), json!(self.model));
-        request.insert("messages".to_owned(), json!(messages));
-        if !tools.is_empty() {
-            request.insert("tools".to_owned(), json!(tools));
-            request.insert("tool_choice".to_owned(), json!("auto"));
-        }
+    fn complete(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<ChatMessage> {
+        let request = ChatCompletionRequest {
+            model: self.model.clone(),
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            tool_choice: (!tools.is_empty()).then_some("auto"),
+        };
 
         let response = self
             .http
@@ -118,7 +205,7 @@ impl LlmConfig {
                 self.base_url.trim_end_matches('/')
             ))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&Value::Object(request))
+            .json(&request)
             .send()
             .with_context(|| {
                 format!(
@@ -129,7 +216,7 @@ impl LlmConfig {
 
         let status = response.status();
         let raw = response.text().context("failed to read LLM response")?;
-        let payload: Value = serde_json::from_str(&raw).with_context(|| {
+        let payload: ChatCompletionResponse = serde_json::from_str(&raw).with_context(|| {
             format!(
                 "LLM returned non-JSON response (HTTP {status}): {}",
                 truncate_error_body(&raw)
@@ -138,22 +225,24 @@ impl LlmConfig {
         if !status.is_success() {
             bail!(
                 "LLM HTTP {status}: {}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| truncate_error_body(&raw))
+                serde_json::to_string_pretty(
+                    &serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!(raw))
+                )
+                .unwrap_or_else(|_| truncate_error_body(&raw))
             );
         }
-        if let Some(error) = payload.get("error") {
+        if let Some(error) = payload.error {
             bail!(
                 "LLM error: {}",
-                serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string())
+                serde_json::to_string_pretty(&error).unwrap_or_else(|_| error.to_string())
             );
         }
 
         payload
-            .get("choices")
-            .and_then(|choices| choices.get(0))
-            .and_then(|choice| choice.get("message"))
-            .cloned()
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
             .context("LLM returned no message")
     }
 }
@@ -172,7 +261,7 @@ fn truncate_error_body(raw: &str) -> String {
 }
 
 struct AgentReply {
-    message: Value,
+    message: ChatMessage,
     text: String,
 }
 
@@ -180,25 +269,17 @@ fn run_agent_turn(
     daemon: &Arc<Mutex<ManagedDaemon>>,
     llm: &LlmConfig,
     tool: &Value,
-    messages: &mut Vec<Value>,
+    messages: &mut Vec<ChatMessage>,
     runtime_dir: &PathBuf,
 ) -> Result<AgentReply> {
     for _ in 0..MAX_AGENT_STEPS {
         let response = llm.complete(messages, std::slice::from_ref(tool))?;
-        let tool_calls = response
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let tool_calls = response.tool_calls.clone().unwrap_or_default();
 
         if tool_calls.is_empty() {
-            let text = response
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            let text = response.content_text().to_owned();
             return Ok(AgentReply {
-                message: json!({ "role": "assistant", "content": text }),
+                message: ChatMessage::assistant_text(text.clone()),
                 text,
             });
         }
@@ -207,20 +288,9 @@ fn run_agent_turn(
 
         for call in tool_calls {
             let mut stop_after_tool_error = false;
-            let call_id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let function = call.get("function").cloned().unwrap_or(Value::Null);
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let arguments = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
+            let call_id = call.id.clone();
+            let name = call.function.name.as_str();
+            let arguments = call.function.arguments.as_str();
 
             let tool_content = if name != "browser" {
                 stop_after_tool_error = true;
@@ -228,15 +298,15 @@ fn run_agent_turn(
             } else {
                 match parse_browser_arguments(arguments) {
                     Ok(actions) => {
-                        let (status, body) =
+                        let response =
                             daemon.lock().expect("daemon mutex poisoned").run(actions)?;
-                        if status == 409 || body.get("status") == Some(&json!("needs_human")) {
-                            show_handoff_to_user(&body, runtime_dir)?;
-                        } else if body.get("status") == Some(&json!("error")) {
-                            show_browser_error_to_user(&body);
+                        if response.needs_human_handoff() {
+                            show_handoff_to_user(response.body(), runtime_dir)?;
+                        } else if response.is_error() {
+                            show_browser_error_to_user(response.body());
                             stop_after_tool_error = true;
                         }
-                        format_tool_result_for_model(status, &body)
+                        format_tool_result_for_model(response.status(), response.body())
                     }
                     Err(error) => {
                         stop_after_tool_error = true;
@@ -245,26 +315,19 @@ fn run_agent_turn(
                 }
             };
 
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": tool_content,
-            }));
+            messages.push(ChatMessage::tool(call_id, tool_content));
 
             if stop_after_tool_error {
-                messages.push(json!({
-                    "role": "system",
-                    "content": "The browser tool just returned a recoverable error. Do not call tools again in this turn. Briefly explain what failed and ask the user how to proceed or suggest a safer next step.",
-                }));
+                messages.push(ChatMessage::system("The browser tool just returned a recoverable error. Do not call tools again in this turn. Briefly explain what failed and ask the user how to proceed or suggest a safer next step."));
                 let response = llm.complete(messages, &[])?;
                 let text = response
-                    .get("content")
-                    .and_then(Value::as_str)
+                    .content
+                    .as_deref()
                     .filter(|text| !text.trim().is_empty())
                     .unwrap_or("The browser action failed. Please choose how you want to proceed.")
                     .to_owned();
                 return Ok(AgentReply {
-                    message: json!({ "role": "assistant", "content": text }),
+                    message: ChatMessage::assistant_text(text.clone()),
                     text,
                 });
             }
@@ -274,18 +337,15 @@ fn run_agent_turn(
     let text =
         "I hit the step limit for this turn. Please continue or narrow the request.".to_owned();
     Ok(AgentReply {
-        message: json!({ "role": "assistant", "content": text }),
+        message: ChatMessage::assistant_text(text.clone()),
         text,
     })
 }
 
 fn parse_browser_arguments(arguments: &str) -> Result<Vec<Action>> {
-    let parsed: Value =
+    let parsed: BrowserToolArguments =
         serde_json::from_str(arguments).context("invalid browser tool arguments")?;
-    parsed
-        .get("actions")
-        .and_then(|actions| serde_json::from_value(actions.clone()).ok())
-        .ok_or_else(|| anyhow::anyhow!("browser tool arguments missing actions"))
+    Ok(parsed.actions)
 }
 
 fn openai_tool(schema: &Value) -> Value {
@@ -315,7 +375,7 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
         .unwrap_or("unknown");
 
     format!(
-        "You are Telephone, a minimal personal assistant with one tool: browser.\n\
+        "You are Emissary, a minimal personal assistant with one tool: browser.\n\
          Use the browser tool to carry out web tasks in a persistent Chrome session. \
          Send short ordered batches of JSON actions. Each tool result includes `title` and \
          `pageText` plus `elements` refs (visible controls after the batch finishes). Use `html` only when you need markup.\n\
@@ -395,10 +455,10 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
             || body.get("pageState") == Some(&json!("bot_challenge"))
         {
             println!(
-                "\nSites like Uber Eats often block automation behind Cloudflare. Complete the check in the handoff browser, then tell Telephone you are done."
+                "\nSites like Uber Eats often block automation behind Cloudflare. Complete the check in the handoff browser, then tell Emissary you are done."
             );
         } else {
-            println!("\nComplete authentication in the browser, then tell Telephone you are done.");
+            println!("\nComplete authentication in the browser, then tell Emissary you are done.");
         }
     } else {
         println!(
@@ -460,4 +520,64 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatCompletionResponse, parse_browser_arguments};
+    use crate::actions::Action;
+
+    #[test]
+    fn parses_text_only_llm_response() {
+        let response: ChatCompletionResponse = serde_json::from_str(
+            r#"{
+                "choices": [
+                    { "message": { "role": "assistant", "content": "hello" } }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let message = &response.choices[0].message;
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn parses_tool_call_llm_response() {
+        let response: ChatCompletionResponse = serde_json::from_str(
+            r#"{
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "browser",
+                                        "arguments": "{\"actions\":[{\"op\":\"observe\"}]}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let call = &response.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.function.name, "browser");
+    }
+
+    #[test]
+    fn parses_browser_tool_arguments() {
+        let actions =
+            parse_browser_arguments(r#"{"actions":[{"op":"webSearch","query":"rust"}]}"#).unwrap();
+        assert!(matches!(actions[0], Action::WebSearch { .. }));
+    }
 }
