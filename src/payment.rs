@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::Tab;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -131,10 +132,12 @@ pub struct PaymentVault {
     profiles: HashMap<String, PaymentProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PaymentFieldMapping {
+    /// Input/select element ref returned by observe/current page elements.
     #[serde(rename = "refId")]
     pub ref_id: String,
+    /// Vault credential ID, e.g. default:card_number, default:exp, default:cvc, default:name, or default:postal_code.
     pub field: String,
 }
 
