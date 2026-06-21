@@ -61,6 +61,10 @@ pub enum Action {
         selector: String,
         field: String,
     },
+    Screenshot {
+        #[serde(default)]
+        selector: Option<String>,
+    },
     Review,
     Handoff,
     Resume,
@@ -177,7 +181,8 @@ pub fn tool_schema() -> Value {
                         { "type": "object", "required": ["op", "expression"], "properties": { "op": { "const": "eval" }, "expression": { "type": "string" } } },
                         { "type": "object", "required": ["op", "profile"], "properties": { "op": { "const": "fillPayment" }, "profile": { "type": "string" } } },
                         { "type": "object", "required": ["op", "selector", "field"], "properties": { "op": { "const": "fillPaymentField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:field, e.g. default:cvc" } } },
-                        { "type": "object", "required": ["op"], "properties": { "op": { "const": "review" } } },
+                        { "type": "object", "required": ["op"], "description": "Capture a safe product/page screenshot for the user. Refuses screenshots when payment fields are visible. Optional selector captures a specific visible element.", "properties": { "op": { "const": "screenshot" }, "selector": { "type": "string", "description": "Optional CSS selector for a product image or page region" } } },
+                        { "type": "object", "required": ["op"], "description": "Capture an order-summary review. Falls back to a safe visible-page screenshot if no basket summary is found and no payment fields are visible.", "properties": { "op": { "const": "review" } } },
                         { "type": "object", "required": ["op"], "description": "Pause automation and return handoff_url", "properties": { "op": { "const": "handoff" } } },
                         { "type": "object", "required": ["op"], "description": "Resume automation after human handoff", "properties": { "op": { "const": "resume" } } }
                     ]
@@ -191,7 +196,7 @@ pub fn tool_schema() -> Value {
                 "title": "Uber Eats",
                 "pageText": "Visible page text snapshot (truncated)…",
                 "elements": [{ "ref": "e1", "kind": "button", "label": "Search" }],
-                "results": [{ "index": 0, "op": "navigate", "ok": { "title": "Example" } }]
+                "results": [{ "index": 0, "op": "screenshot", "ok": { "screenshot_scope": "page_viewport", "screenshot_base64": "..." } }]
             },
             "needs_human": {
                 "status": "needs_human",
@@ -368,6 +373,10 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
         }
+        Action::Screenshot { selector } => Ok(json!(review::capture_safe_page_screenshot(
+            tab,
+            selector.as_deref()
+        )?)),
         Action::Review => Ok(json!(capture_order_review(tab)?)),
         Action::Handoff => {
             if let Some(paused) = context.paused.as_deref_mut() {
@@ -406,6 +415,7 @@ fn op_name(action: &Action) -> &'static str {
         Action::Eval { .. } => "eval",
         Action::FillPayment { .. } => "fillPayment",
         Action::FillPaymentField { .. } => "fillPaymentField",
+        Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
         Action::Handoff => "handoff",
         Action::Resume => "resume",
@@ -435,6 +445,10 @@ fn action_detail(action: &Action) -> String {
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
         }
+        Action::Screenshot { selector } => match selector {
+            Some(selector) => format!("screenshot selector={selector:?}"),
+            None => "screenshot".to_owned(),
+        },
         Action::Title => "title".to_owned(),
         Action::Review => "review".to_owned(),
         Action::Handoff => "handoff".to_owned(),
@@ -897,6 +911,14 @@ mod tests {
             serde_json::from_str(r#"{"actions":[{"op":"webSearch","query":"Ada Lovelace"}]}"#)
                 .unwrap();
         assert!(matches!(request.actions[0], Action::WebSearch { .. }));
+    }
+
+    #[test]
+    fn parses_screenshot_action() {
+        let request: RunRequest =
+            serde_json::from_str(r#"{"actions":[{"op":"screenshot","selector":"img.product"}]}"#)
+                .unwrap();
+        assert!(matches!(request.actions[0], Action::Screenshot { .. }));
     }
 
     #[test]

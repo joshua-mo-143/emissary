@@ -1,6 +1,7 @@
 mod actions;
 mod daemon;
 mod harness;
+mod image_display;
 mod payment;
 mod review;
 mod search;
