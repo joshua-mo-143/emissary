@@ -28,7 +28,25 @@ cargo run -- chat
 
 Emissary auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
 
-On first run, Emissary creates `.agent-runtime/payment.json` with a starter `default` profile (Stripe-style test placeholders). Edit it with your real card details before checkout. The file is created with mode `600`.
+By default, Emissary creates `.agent-runtime/payment.json` with a starter `default` profile (Stripe-style test placeholders) on first run. Edit it with your real card details before checkout. The file is created with mode `600`.
+
+To keep payment details in 1Password instead of a local JSON file, install and sign in to the 1Password CLI (`op`), then point Emissary at a Credit Card item:
+
+```sh
+export PAYMENT_SOURCE=1password
+export PAYMENT_1PASSWORD_VAULT=Private          # optional when item names are unique
+export PAYMENT_1PASSWORD_ITEM="Personal Visa"   # becomes the `default` profile
+cargo run -- chat
+```
+
+For multiple payment profiles:
+
+```sh
+export PAYMENT_SOURCE=1password
+export PAYMENT_1PASSWORD_ITEMS='{"default":"Personal Visa","backup":"Backup Mastercard"}'
+```
+
+`PAYMENT_1PASSWORD_ITEM` / `PAYMENT_1PASSWORD_ITEMS` can use item titles or IDs supported by `op item get`. Emissary runs `op item get --format json --reveal`, reads the card number, expiry, CVC/CVV, cardholder name, and postal/ZIP fields, and only exposes the profile keys to the LLM.
 
 To seed manually instead:
 
@@ -56,7 +74,13 @@ cargo run -- stop
 | `VENICE_TIMEOUT_SECS` | `300` | total timeout for each Venice chat completion request |
 | `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file + review screenshots |
 | `EMISSARY_IMAGE_DISPLAY` | `auto` | image preview mode: `auto`, `inline`, `path`, or `off` |
+| `PAYMENT_SOURCE` | `file` | payment source: `file` or `1password` |
 | `PAYMENT_FILE` | `.agent-runtime/payment.json` | payment vault |
+| `PAYMENT_1PASSWORD_ITEM` | unset | 1Password item title/ID to load as the `default` payment profile |
+| `PAYMENT_1PASSWORD_ITEMS` | unset | JSON object of profile keys to 1Password item titles/IDs |
+| `PAYMENT_1PASSWORD_PROFILE` | `default` | profile key for `PAYMENT_1PASSWORD_ITEM` |
+| `PAYMENT_1PASSWORD_VAULT` | unset | optional 1Password vault passed to `op item get --vault` |
+| `OP_CLI` | `op` | 1Password CLI executable |
 | `CHROME` | auto-detect | Chromium/Chrome binary path |
 | `IDLE_BROWSER_TIMEOUT_SECS` | `3600` | CDP idle timeout; headless_chrome defaults to 30s, which breaks chat while waiting on the LLM |
 | `VNC_PORT`, `NOVNC_PORT`, `SCREEN`, … | see daemon | display stack tuning |
@@ -129,6 +153,8 @@ Payment secrets stay in the vault. Wrong card details are tolerable; blocked sub
 
 ## Payment vault
 
+Local JSON mode (`PAYMENT_SOURCE=file`) uses this shape:
+
 ```json
 {
   "default": {
@@ -141,6 +167,8 @@ Payment secrets stay in the vault. Wrong card details are tolerable; blocked sub
   }
 }
 ```
+
+1Password mode (`PAYMENT_SOURCE=1password`) works with standard Credit Card items. Custom fields are also supported when they are named `card_number`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`; a combined `exp`/`expiry` value such as `12/2028` can be used instead of separate month and year fields.
 
 ## Commands
 

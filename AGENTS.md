@@ -10,14 +10,14 @@ src/
   harness.rs   Venice AI chat loop + browser tool dispatch
   daemon.rs    ManagedDaemon: display stack, Chrome, lock file, shutdown
   actions.rs   JSON browser actions (RunRequest / Action enum)
-  payment.rs   Local payment vault + field injection
+  payment.rs   Payment vault sources (local file or 1Password) + field injection
   review.rs    Basket/total review text + screenshots (no payment fields)
 ```
 
 Runtime data (gitignored):
 
 - `automation-profile/` — persistent Chrome profile
-- `.agent-runtime/` — `daemon.lock`, `payment.json` (auto-created on first run), review/page screenshot PNGs
+- `.agent-runtime/` — `daemon.lock`, `payment.json` in local-file payment mode (auto-created on first run), review/page screenshot PNGs
 - `examples/payment.json.example` — reference copy of the payment vault shape
 
 ## Commands
@@ -37,7 +37,11 @@ Runtime data (gitignored):
 | `VENICE_BASE_URL` | no | `https://api.venice.ai/api/v1` |
 | `VENICE_MODEL` | no | `deepseek-v4-flash` |
 | `CHROME` | no | auto-detect Chromium |
+| `PAYMENT_SOURCE` | no | `file` (`1password` uses the 1Password CLI) |
 | `PAYMENT_FILE` | no | `.agent-runtime/payment.json` |
+| `PAYMENT_1PASSWORD_ITEM` | for `PAYMENT_SOURCE=1password` unless using `PAYMENT_1PASSWORD_ITEMS` | — |
+| `PAYMENT_1PASSWORD_ITEMS` | for multiple 1Password profiles | — |
+| `PAYMENT_1PASSWORD_VAULT` | no | — |
 | `EMISSARY_RUNTIME_DIR` | no | `.agent-runtime` |
 | `EMISSARY_IMAGE_DISPLAY` | no | `auto` |
 
@@ -48,7 +52,7 @@ Venice is OpenAI-compatible; the harness calls `/chat/completions` with tool cal
 1. **Single Rust crate.** Do not add a TypeScript/Node harness or split runtimes without an explicit request.
 2. **Daemon lifetime = chat lifetime.** `ManagedDaemon` starts in `chat`, shuts down on `exit`, normal return, or Ctrl+C. Do not reintroduce a standalone `serve` workflow as the default path.
 3. **Browser tool is the capability boundary.** The LLM sends whitelisted JSON actions only (`Action` enum). No arbitrary JS eval from the model beyond the explicit `eval` action.
-4. **Secrets stay out of the LLM.** Payment data comes from `PaymentVault` keys (`fillPayment`), never from tool arguments or responses. Strip screenshot base64 before returning tool results to the model.
+4. **Secrets stay out of the LLM.** Payment data comes from `PaymentVault` keys (`fillPayment`), whether loaded from the local file or 1Password, never from tool arguments or responses. Strip screenshot base64 before returning tool results to the model.
 5. **Handoff is intentional.** Final purchase clicks and bank 2FA pause automation and surface `needs_human` with basket review or `handoff_url`.
 6. **Review excludes payment UI.** `review` captures order summary regions only; do not screenshot card fields.
 

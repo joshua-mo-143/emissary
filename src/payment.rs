@@ -4,12 +4,23 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
+const PAYMENT_SOURCE_ENV: &str = "PAYMENT_SOURCE";
 const PAYMENT_FILE_ENV: &str = "PAYMENT_FILE";
 const DEFAULT_PAYMENT_FILE: &str = ".agent-runtime/payment.json";
+const PAYMENT_SOURCE_FILE: &str = "file";
+const PAYMENT_SOURCE_1PASSWORD: &str = "1password";
+const PAYMENT_SOURCE_ONEPASSWORD: &str = "onepassword";
+const ONEPASSWORD_ITEM_ENV: &str = "PAYMENT_1PASSWORD_ITEM";
+const ONEPASSWORD_ITEMS_ENV: &str = "PAYMENT_1PASSWORD_ITEMS";
+const ONEPASSWORD_PROFILE_ENV: &str = "PAYMENT_1PASSWORD_PROFILE";
+const ONEPASSWORD_VAULT_ENV: &str = "PAYMENT_1PASSWORD_VAULT";
+const ONEPASSWORD_CLI_ENV: &str = "OP_CLI";
+const DEFAULT_PAYMENT_PROFILE: &str = "default";
 
 const DEFAULT_PAYMENT_TEMPLATE: &str = r#"{
   "default": {
@@ -133,7 +144,13 @@ pub struct PaymentVault {
 
 impl PaymentVault {
     pub fn load() -> Result<Self> {
-        let path = payment_file_path();
+        match payment_source()? {
+            PaymentSource::File(path) => Self::load_from_file(path),
+            PaymentSource::OnePassword(config) => Self::load_from_1password(config),
+        }
+    }
+
+    fn load_from_file(path: PathBuf) -> Result<Self> {
         if !path.exists() {
             create_default_payment_file(&path)?;
             eprintln!(
@@ -151,8 +168,28 @@ impl PaymentVault {
         Ok(Self { profiles })
     }
 
+    fn load_from_1password(config: OnePasswordConfig) -> Result<Self> {
+        let mut profiles = HashMap::new();
+        for (profile_key, item_ref) in &config.items {
+            let raw = run_onepassword_item_get(&config, item_ref)?;
+            let profile = parse_onepassword_item_json(&raw, item_ref)?;
+            if profiles.insert(profile_key.clone(), profile).is_some() {
+                bail!("duplicate 1Password payment profile `{profile_key}`");
+            }
+        }
+        Ok(Self { profiles })
+    }
+
     pub fn payment_file_path() -> PathBuf {
         payment_file_path()
+    }
+
+    pub fn configuration_hint() -> String {
+        if onepassword_source_enabled() {
+            format!("set {ONEPASSWORD_ITEM_ENV} or {ONEPASSWORD_ITEMS_ENV}")
+        } else {
+            format!("edit {}", payment_file_path().display())
+        }
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -309,6 +346,299 @@ fn parse_field_ref(field_ref: &str) -> Result<(&str, &str)> {
     }
 }
 
+enum PaymentSource {
+    File(PathBuf),
+    OnePassword(OnePasswordConfig),
+}
+
+struct OnePasswordConfig {
+    cli: String,
+    vault: Option<String>,
+    items: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+struct OnePasswordItem {
+    #[serde(default)]
+    fields: Vec<OnePasswordField>,
+}
+
+#[derive(Deserialize)]
+struct OnePasswordField {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    value: Value,
+}
+
+#[derive(Default)]
+struct PartialPaymentProfile {
+    card_number: Option<String>,
+    exp_month: Option<String>,
+    exp_year: Option<String>,
+    cvc: Option<String>,
+    name: Option<String>,
+    postal_code: Option<String>,
+}
+
+fn payment_source() -> Result<PaymentSource> {
+    let source = env::var(PAYMENT_SOURCE_ENV).unwrap_or_else(|_| PAYMENT_SOURCE_FILE.to_owned());
+    match source.trim().to_ascii_lowercase().as_str() {
+        "" | PAYMENT_SOURCE_FILE => Ok(PaymentSource::File(payment_file_path())),
+        PAYMENT_SOURCE_1PASSWORD | PAYMENT_SOURCE_ONEPASSWORD => {
+            Ok(PaymentSource::OnePassword(onepassword_config()?))
+        }
+        other => bail!(
+            "unsupported {PAYMENT_SOURCE_ENV} `{other}`; expected `{PAYMENT_SOURCE_FILE}` or `{PAYMENT_SOURCE_1PASSWORD}`"
+        ),
+    }
+}
+
+fn onepassword_source_enabled() -> bool {
+    env::var(PAYMENT_SOURCE_ENV)
+        .map(|source| {
+            let source = source.trim().to_ascii_lowercase();
+            source == PAYMENT_SOURCE_1PASSWORD || source == PAYMENT_SOURCE_ONEPASSWORD
+        })
+        .unwrap_or(false)
+}
+
+fn onepassword_config() -> Result<OnePasswordConfig> {
+    let items = parse_onepassword_items(
+        env::var(ONEPASSWORD_ITEMS_ENV).ok().as_deref(),
+        env::var(ONEPASSWORD_ITEM_ENV).ok().as_deref(),
+        env::var(ONEPASSWORD_PROFILE_ENV).ok().as_deref(),
+    )?;
+    let cli = env::var(ONEPASSWORD_CLI_ENV).unwrap_or_else(|_| "op".to_owned());
+    let vault = env::var(ONEPASSWORD_VAULT_ENV)
+        .ok()
+        .map(|vault| vault.trim().to_owned())
+        .filter(|vault| !vault.is_empty());
+
+    Ok(OnePasswordConfig { cli, vault, items })
+}
+
+fn parse_onepassword_items(
+    items_json: Option<&str>,
+    single_item: Option<&str>,
+    single_profile: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    match (items_json, single_item) {
+        (Some(_), Some(_)) => {
+            bail!("set only one of {ONEPASSWORD_ITEMS_ENV} or {ONEPASSWORD_ITEM_ENV}")
+        }
+        (Some(raw), None) => {
+            let map = serde_json::from_str::<HashMap<String, String>>(raw).with_context(|| {
+                format!(
+                    "{ONEPASSWORD_ITEMS_ENV} must be a JSON object of profile keys to item refs"
+                )
+            })?;
+            let mut items = Vec::new();
+            for (profile_key, item_ref) in map {
+                let profile_key = profile_key.trim().to_owned();
+                let item_ref = item_ref.trim().to_owned();
+                if profile_key.is_empty() || item_ref.is_empty() {
+                    bail!("{ONEPASSWORD_ITEMS_ENV} cannot contain empty profile keys or item refs");
+                }
+                items.push((profile_key, item_ref));
+            }
+            if items.is_empty() {
+                bail!("{ONEPASSWORD_ITEMS_ENV} must contain at least one payment profile");
+            }
+            items.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(items)
+        }
+        (None, Some(item_ref)) => {
+            let item_ref = item_ref.trim();
+            if item_ref.is_empty() {
+                bail!("{ONEPASSWORD_ITEM_ENV} cannot be empty");
+            }
+            let profile_key = single_profile
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+                .unwrap_or(DEFAULT_PAYMENT_PROFILE);
+            Ok(vec![(profile_key.to_owned(), item_ref.to_owned())])
+        }
+        (None, None) => {
+            bail!(
+                "{PAYMENT_SOURCE_ENV}=1password requires {ONEPASSWORD_ITEM_ENV} or {ONEPASSWORD_ITEMS_ENV}"
+            )
+        }
+    }
+}
+
+fn run_onepassword_item_get(config: &OnePasswordConfig, item_ref: &str) -> Result<String> {
+    let mut command = Command::new(&config.cli);
+    command.args(["item", "get", item_ref, "--format", "json", "--reveal"]);
+    if let Some(vault) = &config.vault {
+        command.args(["--vault", vault]);
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run 1Password CLI `{}`", config.cli))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        if message.is_empty() {
+            bail!("1Password CLI failed to read payment item `{item_ref}`");
+        }
+        bail!("1Password CLI failed to read payment item `{item_ref}`: {message}");
+    }
+
+    String::from_utf8(output.stdout).context("1Password CLI returned non-UTF-8 item JSON")
+}
+
+fn parse_onepassword_item_json(raw: &str, item_ref: &str) -> Result<PaymentProfile> {
+    let item = serde_json::from_str::<OnePasswordItem>(raw)
+        .with_context(|| format!("failed to parse 1Password item `{item_ref}` JSON"))?;
+    let mut profile = PartialPaymentProfile::default();
+
+    for field in item.fields {
+        let Some(value) = onepassword_field_value(&field) else {
+            continue;
+        };
+        let keys = [field.id.as_deref(), field.label.as_deref()];
+        for key in keys.into_iter().flatten().map(normalize_1password_key) {
+            match key.as_str() {
+                "cardnumber" | "ccnum" | "creditcardnumber" | "number" => {
+                    set_if_missing(&mut profile.card_number, sanitize_card_number(&value));
+                }
+                "expirationdate" | "expirydate" | "expiration" | "expiry" | "expires" | "exp" => {
+                    if let Some((month, year)) = parse_expiry_parts(&value)? {
+                        set_if_missing(&mut profile.exp_month, month);
+                        set_if_missing(&mut profile.exp_year, year);
+                    }
+                }
+                "expirationmonth" | "expirymonth" | "expmonth" | "expmonth2" | "month" => {
+                    set_if_missing(&mut profile.exp_month, value.trim().to_owned());
+                }
+                "expirationyear" | "expiryyear" | "expyear" | "year" => {
+                    set_if_missing(&mut profile.exp_year, value.trim().to_owned());
+                }
+                "cvc" | "cvv" | "securitycode" | "verificationnumber" => {
+                    set_if_missing(&mut profile.cvc, value.trim().to_owned());
+                }
+                "name" | "cardholder" | "cardholdername" | "nameoncard" => {
+                    set_if_missing(&mut profile.name, value.trim().to_owned());
+                }
+                "postalcode" | "postcode" | "zip" | "zipcode" | "billingzip"
+                | "billingpostalcode" => {
+                    set_if_missing(&mut profile.postal_code, value.trim().to_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    profile.into_payment_profile(item_ref)
+}
+
+fn onepassword_field_value(field: &OnePasswordField) -> Option<String> {
+    match &field.value {
+        Value::String(value) => non_empty(value),
+        Value::Number(value) => non_empty(&value.to_string()),
+        _ => None,
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn normalize_1password_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn set_if_missing(target: &mut Option<String>, value: String) {
+    if target.is_none() && !value.trim().is_empty() {
+        *target = Some(value);
+    }
+}
+
+fn sanitize_card_number(value: &str) -> String {
+    let digits = value
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        value.trim().to_owned()
+    } else {
+        digits
+    }
+}
+
+fn parse_expiry_parts(raw: &str) -> Result<Option<(String, String)>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parts = trimmed
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() >= 2 {
+        let (month, year) = if parts[0].len() == 4 {
+            (parts[1], parts[0])
+        } else {
+            (parts[0], parts[1])
+        };
+        return Ok(Some((normalize_month(month)?, normalize_year(year)?)));
+    }
+
+    let digits = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    match digits.len() {
+        4 => Ok(Some((
+            normalize_month(&digits[..2])?,
+            normalize_year(&digits[2..])?,
+        ))),
+        6 if digits.starts_with("20") || digits.starts_with("19") => Ok(Some((
+            normalize_month(&digits[4..])?,
+            normalize_year(&digits[..4])?,
+        ))),
+        6 => Ok(Some((
+            normalize_month(&digits[..2])?,
+            normalize_year(&digits[2..])?,
+        ))),
+        _ => bail!("could not parse 1Password expiry value `{trimmed}`"),
+    }
+}
+
+impl PartialPaymentProfile {
+    fn into_payment_profile(self, item_ref: &str) -> Result<PaymentProfile> {
+        Ok(PaymentProfile {
+            card_number: self
+                .card_number
+                .ok_or_else(|| anyhow!("1Password item `{item_ref}` has no card number field"))?,
+            exp_month: self
+                .exp_month
+                .ok_or_else(|| anyhow!("1Password item `{item_ref}` has no expiration month"))?,
+            exp_year: self
+                .exp_year
+                .ok_or_else(|| anyhow!("1Password item `{item_ref}` has no expiration year"))?,
+            cvc: self
+                .cvc
+                .ok_or_else(|| anyhow!("1Password item `{item_ref}` has no CVC/CVV field"))?,
+            name: self.name,
+            postal_code: self.postal_code,
+        })
+    }
+}
+
 fn format_exp_combined(profile: &PaymentProfile) -> Result<String> {
     let month = normalize_month(&profile.exp_month)?;
     let year = normalize_year(&profile.exp_year)?;
@@ -452,8 +782,13 @@ fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaymentVault, is_sensitive_submit, parse_field_ref};
-    use std::fs;
+    use super::{
+        PaymentVault, is_sensitive_submit, parse_field_ref, parse_onepassword_item_json,
+        parse_onepassword_items,
+    };
+    use std::{fs, sync::Mutex};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn blocks_final_purchase_actions() {
@@ -483,7 +818,89 @@ mod tests {
     }
 
     #[test]
+    fn parses_onepassword_single_item_config() {
+        let items = parse_onepassword_items(None, Some("Personal Visa"), Some("primary")).unwrap();
+        assert_eq!(
+            items,
+            vec![("primary".to_owned(), "Personal Visa".to_owned())]
+        );
+
+        let default_items = parse_onepassword_items(None, Some("Personal Visa"), None).unwrap();
+        assert_eq!(
+            default_items,
+            vec![("default".to_owned(), "Personal Visa".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parses_onepassword_multi_item_config() {
+        let items = parse_onepassword_items(
+            Some(r#"{"backup":"Backup Mastercard","default":"Personal Visa"}"#),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            items,
+            vec![
+                ("backup".to_owned(), "Backup Mastercard".to_owned()),
+                ("default".to_owned(), "Personal Visa".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_standard_onepassword_credit_card_item() {
+        let profile = parse_onepassword_item_json(
+            r#"{
+                "fields": [
+                    { "id": "ccnum", "label": "number", "value": "4242 4242 4242 4242" },
+                    { "id": "expiry", "label": "expiry date", "value": "12/2028" },
+                    { "id": "cvv", "label": "verification number", "value": "123" },
+                    { "id": "cardholder", "label": "cardholder name", "value": "Jane Doe" },
+                    { "id": "zip", "label": "ZIP", "value": "94107" }
+                ]
+            }"#,
+            "Personal Visa",
+        )
+        .unwrap();
+
+        assert_eq!(profile.card_number, "4242424242424242");
+        assert_eq!(profile.exp_month, "12");
+        assert_eq!(profile.exp_year, "28");
+        assert_eq!(profile.cvc, "123");
+        assert_eq!(profile.name.as_deref(), Some("Jane Doe"));
+        assert_eq!(profile.postal_code.as_deref(), Some("94107"));
+    }
+
+    #[test]
+    fn parses_custom_onepassword_payment_fields() {
+        let profile = parse_onepassword_item_json(
+            r#"{
+                "fields": [
+                    { "label": "card_number", "value": "4242424242424242" },
+                    { "label": "exp_month", "value": "7" },
+                    { "label": "exp_year", "value": "2029" },
+                    { "label": "cvc", "value": "321" },
+                    { "label": "name", "value": "Jane Doe" },
+                    { "label": "postal_code", "value": "94107" }
+                ]
+            }"#,
+            "Custom Card",
+        )
+        .unwrap();
+
+        assert_eq!(profile.card_number, "4242424242424242");
+        assert_eq!(profile.exp_month, "7");
+        assert_eq!(profile.exp_year, "2029");
+        assert_eq!(profile.cvc, "321");
+        assert_eq!(profile.name.as_deref(), Some("Jane Doe"));
+        assert_eq!(profile.postal_code.as_deref(), Some("94107"));
+    }
+
+    #[test]
     fn creates_default_payment_file_when_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "emissary-payment-create-test-{}",
             std::process::id()
@@ -493,7 +910,9 @@ mod tests {
         let path = dir.join("payment.json");
 
         let previous = std::env::var("PAYMENT_FILE").ok();
+        let previous_source = std::env::var("PAYMENT_SOURCE").ok();
         unsafe {
+            std::env::set_var("PAYMENT_SOURCE", "file");
             std::env::set_var("PAYMENT_FILE", path.to_string_lossy().to_string());
         }
         let vault = PaymentVault::load().unwrap();
@@ -503,11 +922,16 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("PAYMENT_FILE", value) },
             None => unsafe { std::env::remove_var("PAYMENT_FILE") },
         }
+        match previous_source {
+            Some(value) => unsafe { std::env::set_var("PAYMENT_SOURCE", value) },
+            None => unsafe { std::env::remove_var("PAYMENT_SOURCE") },
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn loads_payment_profiles_from_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir =
             std::env::temp_dir().join(format!("emissary-payment-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -527,7 +951,9 @@ mod tests {
         .unwrap();
 
         let previous = std::env::var("PAYMENT_FILE").ok();
+        let previous_source = std::env::var("PAYMENT_SOURCE").ok();
         unsafe {
+            std::env::set_var("PAYMENT_SOURCE", "file");
             std::env::set_var("PAYMENT_FILE", path.to_string_lossy().to_string());
         }
         let vault = PaymentVault::load().unwrap();
@@ -535,6 +961,10 @@ mod tests {
         match previous {
             Some(value) => unsafe { std::env::set_var("PAYMENT_FILE", value) },
             None => unsafe { std::env::remove_var("PAYMENT_FILE") },
+        }
+        match previous_source {
+            Some(value) => unsafe { std::env::set_var("PAYMENT_SOURCE", value) },
+            None => unsafe { std::env::remove_var("PAYMENT_SOURCE") },
         }
         let _ = fs::remove_dir_all(&dir);
     }

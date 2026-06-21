@@ -40,8 +40,8 @@ pub fn chat() -> Result<()> {
     };
     if payment_keys.is_empty() {
         eprintln!(
-            "warning: no payment profiles loaded; edit {}",
-            PaymentVault::payment_file_path().display()
+            "warning: no payment profiles loaded; {}",
+            PaymentVault::configuration_hint()
         );
     }
 
