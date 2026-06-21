@@ -101,6 +101,8 @@ Follow these conventions when editing this repo.
 
 **Add a browser action:** extend `Action` in `actions.rs`, handle it in `execute_action`, update `tool_schema()`, README, and this file.
 
+**Payment field filling:** prefer `observe` -> `fillPaymentRefs` for checkout fields. The LLM maps observed input refs to vault credential IDs such as `default:card_number` or `default:cvc`; it must never send card values, CVV values, or other payment secret values in tool arguments. Keep `fillPayment` / `fillPaymentField` as fallbacks for cases where refs are unavailable.
+
 **Browser interaction style:** prefer `observe` -> `clickRef` / `typeRef` for normal browsing. `observe` assigns stable `data-emissary-ref` IDs to visible controls and returns them as `elements`, which avoids brittle model-invented CSS selectors. Keep direct `click` / `type` for simple known selectors or tests.
 
 **Image previews:** use `screenshot` for product/page previews before checkout and `review` for basket/order-summary captures. Product/page screenshots must refuse to run when visible payment fields are present; order review screenshots must stay scoped away from payment UI. Terminal inline rendering is a default Cargo feature (`terminal-images`) with saved PNG path fallback.

@@ -1,82 +1,92 @@
-use crate::payment::{PaymentVault, block_type_on_payment_field, is_sensitive_submit};
+use crate::payment::{
+    PaymentFieldMapping, PaymentVault, block_type_on_payment_field, is_sensitive_submit,
+};
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
 use headless_chrome::Tab;
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{sync::Arc, thread, time::Duration};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Action {
-    WebSearch {
-        query: String,
-    },
-    Navigate {
-        url: String,
-    },
+    /// Search DuckDuckGo Instant Answer for facts and entities without using the browser.
+    WebSearch { query: String },
+    /// Navigate the browser to a URL.
+    Navigate { url: String },
+    /// Return visible page text and stable refs for clickable/input elements.
     Observe,
-    Click {
-        selector: String,
-    },
+    /// Click a visible element by CSS selector, or XPath when the selector starts with //.
+    Click { selector: String },
+    /// Click an element ref returned by observe/current page elements.
     ClickRef {
         #[serde(rename = "refId")]
         ref_id: String,
     },
-    ClickText {
-        text: String,
-    },
-    Type {
-        selector: String,
-        text: String,
-    },
+    /// Click a button or link by visible label text.
+    ClickText { text: String },
+    /// Type text into a selector. Do not use for payment fields.
+    Type { selector: String, text: String },
+    /// Type text into an observed element ref. Do not use for payment fields.
     TypeRef {
         #[serde(rename = "refId")]
         ref_id: String,
         text: String,
     },
-    Press {
-        key: String,
-    },
-    Wait {
-        selector: String,
-    },
+    /// Press a keyboard key such as Enter or Tab.
+    Press { key: String },
+    /// Wait for a CSS selector or XPath to become visible.
+    Wait { selector: String },
+    /// Return the current page title.
     Title,
+    /// Return innerText for a selector, defaulting to body.
     Text {
         #[serde(default = "default_body_selector")]
         selector: String,
     },
+    /// Return innerHTML for a selector, defaulting to body.
     Html {
         #[serde(default = "default_body_selector")]
         selector: String,
     },
-    Eval {
-        expression: String,
+    /// Evaluate JavaScript in the page.
+    Eval { expression: String },
+    /// Legacy automatic payment form fill by profile key. Prefer observe -> fillPaymentRefs.
+    FillPayment { profile: String },
+    /// Fill payment fields by observed element refs and vault credential IDs.
+    FillPaymentRefs {
+        #[schemars(length(min = 1))]
+        fields: Vec<PaymentFieldMapping>,
     },
-    FillPayment {
-        profile: String,
-    },
-    FillPaymentField {
-        selector: String,
-        field: String,
-    },
+    /// Fill one payment field by selector and vault credential ID.
+    FillPaymentField { selector: String, field: String },
+    /// Capture a safe product/page screenshot for the user.
     Screenshot {
         #[serde(default)]
         selector: Option<String>,
     },
+    /// Capture an order-summary review, scoped away from payment UI.
     Review,
+    /// Pause automation and return handoff_url.
     Handoff,
+    /// Resume automation after human handoff.
     Resume,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunRequest {
+    /// Ordered browser actions to run in the current session.
+    #[schemars(length(min = 1))]
     pub actions: Vec<Action>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BrowserToolArguments {
+    /// Ordered browser actions to run in the current session. Execution stops on the first handoff or error.
+    #[schemars(length(min = 1))]
     pub actions: Vec<Action>,
 }
 
@@ -148,47 +158,17 @@ pub struct RunContext<'a> {
 }
 
 pub fn tool_schema() -> Value {
+    let mut parameters = serde_json::to_value(schema_for!(BrowserToolArguments))
+        .expect("browser tool argument schema serializes to JSON");
+    if let Some(object) = parameters.as_object_mut() {
+        object.remove("$schema");
+        object.remove("title");
+    }
+
     json!({
         "name": "browser",
         "description": "Browser-use tool for the Emissary harness. Controls a persistent local Chrome session, with payment vault injection, basket review screenshots, and human handoff for final submits or bank 2FA.",
-        "parameters": {
-            "type": "object",
-            "required": ["actions"],
-            "properties": {
-                "actions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "$ref": "#/$defs/action" },
-                    "description": "Ordered browser actions to run in the current session. Execution stops on the first handoff or error."
-                }
-            },
-            "$defs": {
-                "action": {
-                    "oneOf": [
-                        { "type": "object", "required": ["op", "query"], "description": "Search DuckDuckGo Instant Answer for facts and entities without using the browser", "properties": { "op": { "const": "webSearch" }, "query": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "url"], "properties": { "op": { "const": "navigate" }, "url": { "type": "string", "format": "uri" } } },
-                        { "type": "object", "required": ["op"], "properties": { "op": { "const": "observe" } }, "description": "Return visible page text and stable refs for clickable/input elements" },
-                        { "type": "object", "required": ["op", "selector"], "properties": { "op": { "const": "click" }, "selector": { "type": "string", "description": "Valid CSS selector, or XPath when the value starts with //" } } },
-                        { "type": "object", "required": ["op", "refId"], "properties": { "op": { "const": "clickRef" }, "refId": { "type": "string", "description": "Element ref returned by observe/current page elements" } } },
-                        { "type": "object", "required": ["op", "text"], "properties": { "op": { "const": "clickText" }, "text": { "type": "string", "description": "Visible label on a button or link to click" } } },
-                        { "type": "object", "required": ["op", "selector", "text"], "properties": { "op": { "const": "type" }, "selector": { "type": "string" }, "text": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "refId", "text"], "properties": { "op": { "const": "typeRef" }, "refId": { "type": "string" }, "text": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "key"], "properties": { "op": { "const": "press" }, "key": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "selector"], "properties": { "op": { "const": "wait" }, "selector": { "type": "string" } } },
-                        { "type": "object", "required": ["op"], "properties": { "op": { "const": "title" } } },
-                        { "type": "object", "required": ["op"], "properties": { "op": { "const": "text" }, "selector": { "type": "string", "default": "body" } } },
-                        { "type": "object", "required": ["op"], "properties": { "op": { "const": "html" }, "selector": { "type": "string", "default": "body" } } },
-                        { "type": "object", "required": ["op", "expression"], "properties": { "op": { "const": "eval" }, "expression": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "profile"], "properties": { "op": { "const": "fillPayment" }, "profile": { "type": "string" } } },
-                        { "type": "object", "required": ["op", "selector", "field"], "properties": { "op": { "const": "fillPaymentField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:field, e.g. default:cvc" } } },
-                        { "type": "object", "required": ["op"], "description": "Capture a safe product/page screenshot for the user. Refuses screenshots when payment fields are visible. Optional selector captures a specific visible element.", "properties": { "op": { "const": "screenshot" }, "selector": { "type": "string", "description": "Optional CSS selector for a product image or page region" } } },
-                        { "type": "object", "required": ["op"], "description": "Capture an order-summary review. Falls back to a safe visible-page screenshot if no basket summary is found and no payment fields are visible.", "properties": { "op": { "const": "review" } } },
-                        { "type": "object", "required": ["op"], "description": "Pause automation and return handoff_url", "properties": { "op": { "const": "handoff" } } },
-                        { "type": "object", "required": ["op"], "description": "Resume automation after human handoff", "properties": { "op": { "const": "resume" } } }
-                    ]
-                }
-            }
-        },
+        "parameters": parameters,
         "responses": {
             "ok": {
                 "status": "ok",
@@ -370,6 +350,9 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillPayment { profile } => {
             PaymentVault::fill_payment(tab, context.payment, profile)
         }
+        Action::FillPaymentRefs { fields } => {
+            PaymentVault::fill_payment_refs(tab, context.payment, fields)
+        }
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
         }
@@ -414,6 +397,7 @@ fn op_name(action: &Action) -> &'static str {
         Action::Html { .. } => "html",
         Action::Eval { .. } => "eval",
         Action::FillPayment { .. } => "fillPayment",
+        Action::FillPaymentRefs { .. } => "fillPaymentRefs",
         Action::FillPaymentField { .. } => "fillPaymentField",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
@@ -442,6 +426,14 @@ fn action_detail(action: &Action) -> String {
         Action::Html { selector } => format!("html selector={selector:?}"),
         Action::Eval { expression } => format!("eval expression={expression:?}"),
         Action::FillPayment { profile } => format!("fillPayment profile={profile}"),
+        Action::FillPaymentRefs { fields } => {
+            let mappings = fields
+                .iter()
+                .map(|field| format!("{}={}", field.ref_id, field.field))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("fillPaymentRefs fields=[{mappings}]")
+        }
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
         }
@@ -903,6 +895,15 @@ mod tests {
         assert!(matches!(request.actions[0], Action::Observe));
         assert!(matches!(request.actions[1], Action::ClickRef { .. }));
         assert!(matches!(request.actions[2], Action::TypeRef { .. }));
+    }
+
+    #[test]
+    fn parses_payment_ref_fill_action() {
+        let request: RunRequest = serde_json::from_str(
+            r#"{"actions":[{"op":"fillPaymentRefs","fields":[{"refId":"e2","field":"default:card_number"},{"refId":"e3","field":"default:cvc"}]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.actions[0], Action::FillPaymentRefs { .. }));
     }
 
     #[test]
