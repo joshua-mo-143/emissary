@@ -180,10 +180,6 @@ impl PaymentVault {
         Ok(Self { profiles })
     }
 
-    pub fn payment_file_path() -> PathBuf {
-        payment_file_path()
-    }
-
     pub fn configuration_hint() -> String {
         if onepassword_source_enabled() {
             format!("set {ONEPASSWORD_ITEM_ENV} or {ONEPASSWORD_ITEMS_ENV}")
