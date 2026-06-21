@@ -1,4 +1,4 @@
-use crate::payment::{PaymentVault, block_type_on_payment_field, is_sensitive_submit};
+use crate::payment::{PaymentVault, block_type_on_credential_field, is_sensitive_submit};
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
@@ -58,6 +58,15 @@ pub enum Action {
         profile: String,
     },
     FillPaymentField {
+        selector: String,
+        field: String,
+    },
+    FillAddress {
+        profile: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
+    FillAddressField {
         selector: String,
         field: String,
     },
@@ -181,6 +190,8 @@ pub fn tool_schema() -> Value {
                         { "type": "object", "required": ["op", "expression"], "properties": { "op": { "const": "eval" }, "expression": { "type": "string" } } },
                         { "type": "object", "required": ["op", "profile"], "properties": { "op": { "const": "fillPayment" }, "profile": { "type": "string" } } },
                         { "type": "object", "required": ["op", "selector", "field"], "properties": { "op": { "const": "fillPaymentField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:field, e.g. default:cvc" } } },
+                        { "type": "object", "required": ["op", "profile"], "properties": { "op": { "const": "fillAddress" }, "profile": { "type": "string" }, "kind": { "type": "string", "enum": ["shipping", "billing"], "default": "shipping" } } },
+                        { "type": "object", "required": ["op", "selector", "field"], "properties": { "op": { "const": "fillAddressField" }, "selector": { "type": "string" }, "field": { "type": "string", "description": "profile:kind.field, e.g. default:shipping.postal_code" } } },
                         { "type": "object", "required": ["op"], "description": "Capture a safe product/page screenshot for the user. Refuses screenshots when payment fields are visible. Optional selector captures a specific visible element.", "properties": { "op": { "const": "screenshot" }, "selector": { "type": "string", "description": "Optional CSS selector for a product image or page region" } } },
                         { "type": "object", "required": ["op"], "description": "Capture an order-summary review. Falls back to a safe visible-page screenshot if no basket summary is found and no payment fields are visible.", "properties": { "op": { "const": "review" } } },
                         { "type": "object", "required": ["op"], "description": "Pause automation and return handoff_url", "properties": { "op": { "const": "handoff" } } },
@@ -341,14 +352,14 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::Type { selector, text } => {
             let element = wait_for_target(tab, selector)
                 .map_err(|error| enrich_selector_error(selector, error))?;
-            block_type_on_payment_field(tab, selector)?;
+            block_type_on_credential_field(tab, selector)?;
             element.click()?;
             tab.type_str(text)?;
             Ok(json!({ "selector": selector, "typed": text }))
         }
         Action::TypeRef { ref_id, text } => {
-            if element_ref_is_payment_field(tab, ref_id)? {
-                bail!("payment field must use fill_payment or fill_payment_field");
+            if element_ref_is_credential_field(tab, ref_id)? {
+                bail!("credential fields must use fillPayment/fillAddress vault actions");
             }
             type_by_ref(tab, ref_id, text)
         }
@@ -372,6 +383,12 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         }
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
+        }
+        Action::FillAddress { profile, kind } => {
+            PaymentVault::fill_address(tab, context.payment, profile, kind.as_deref())
+        }
+        Action::FillAddressField { selector, field } => {
+            PaymentVault::fill_address_field(tab, context.payment, selector, field)
         }
         Action::Screenshot { selector } => Ok(json!(review::capture_safe_page_screenshot(
             tab,
@@ -415,6 +432,8 @@ fn op_name(action: &Action) -> &'static str {
         Action::Eval { .. } => "eval",
         Action::FillPayment { .. } => "fillPayment",
         Action::FillPaymentField { .. } => "fillPaymentField",
+        Action::FillAddress { .. } => "fillAddress",
+        Action::FillAddressField { .. } => "fillAddressField",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
         Action::Handoff => "handoff",
@@ -444,6 +463,12 @@ fn action_detail(action: &Action) -> String {
         Action::FillPayment { profile } => format!("fillPayment profile={profile}"),
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
+        }
+        Action::FillAddress { profile, kind } => {
+            format!("fillAddress profile={profile} kind={kind:?}")
+        }
+        Action::FillAddressField { selector, field } => {
+            format!("fillAddressField selector={selector:?} field={field}")
         }
         Action::Screenshot { selector } => match selector {
             Some(selector) => format!("screenshot selector={selector:?}"),
@@ -755,7 +780,7 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
     }
 }
 
-fn element_ref_is_payment_field(tab: &Tab, ref_id: &str) -> Result<bool> {
+fn element_ref_is_credential_field(tab: &Tab, ref_id: &str) -> Result<bool> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
         r##"(() => {{
@@ -763,14 +788,15 @@ fn element_ref_is_payment_field(tab: &Tab, ref_id: &str) -> Result<bool> {
             const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
                 .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return false;
+            const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
+            if (/^(cc-|shipping |billing )/.test(autocomplete)) return true;
             const hay = [
-                el.getAttribute("autocomplete"),
                 el.getAttribute("name"),
                 el.getAttribute("id"),
                 el.getAttribute("aria-label"),
                 el.getAttribute("placeholder")
             ].filter(Boolean).join(" ").toLowerCase();
-            return /cc-|card|cvc|cvv|security code|expiry|expiration/.test(hay);
+            return /cc-|card|cvc|cvv|security code|expiry|expiration|postal|postcode|zip|address|street|city|state|province|country|phone|email/.test(hay);
         }})()"##
     );
     Ok(tab
@@ -919,6 +945,19 @@ mod tests {
             serde_json::from_str(r#"{"actions":[{"op":"screenshot","selector":"img.product"}]}"#)
                 .unwrap();
         assert!(matches!(request.actions[0], Action::Screenshot { .. }));
+    }
+
+    #[test]
+    fn parses_address_fill_actions() {
+        let request: RunRequest = serde_json::from_str(
+            r##"{"actions":[{"op":"fillAddress","profile":"default","kind":"billing"},{"op":"fillAddressField","selector":"#zip","field":"default:shipping.postal_code"}]}"##,
+        )
+        .unwrap();
+        assert!(matches!(request.actions[0], Action::FillAddress { .. }));
+        assert!(matches!(
+            request.actions[1],
+            Action::FillAddressField { .. }
+        ));
     }
 
     #[test]

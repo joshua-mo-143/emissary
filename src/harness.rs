@@ -392,9 +392,10 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          Errors:\n\
          - If an action fails (missing element, invalid selector, etc.), the tool returns status error with pageText so you can adjust and retry.\n\
          - If pageState is bot_challenge or mode is blocked, stop retrying automation. Ask whether to use another site, continue manually in a normal browser, or retry after the user has cleared Cloudflare outside the harness.\n\
-         Payment:\n\
-         - Never put card numbers or CVV in tool arguments.\n\
-         - Use fillPayment with a profile key when checkout needs card details. Loaded profiles: {profiles}.\n\
+         Credentials:\n\
+         - Never put card numbers, CVV, shipping address, billing address, email, or phone in tool arguments.\n\
+         - Use fillPayment with a profile key when checkout needs card details.\n\
+         - Use fillAddress with kind `shipping` or `billing` when checkout needs address/contact fields. Loaded profiles: {profiles}.\n\
          Images:\n\
          - When the user asks about appearance, product photos, or wants to buy a specific item, use screenshot before checkout when helpful. \
          Prefer a selector for the product image/card when available; otherwise capture the visible page.\n\

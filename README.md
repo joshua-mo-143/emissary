@@ -28,33 +28,37 @@ cargo run -- chat
 
 Emissary auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
 
-By default, Emissary creates `.agent-runtime/payment.json` with a starter `default` profile (Stripe-style test placeholders) on first run. Edit it with your real card details before checkout. The file is created with mode `600`.
-
-To keep payment details in 1Password instead of a local JSON file, install and sign in to the 1Password CLI (`op`), then point Emissary at a Credit Card item:
+Emissary loads checkout credentials only from 1Password. Install and sign in to the 1Password CLI (`op`), then point Emissary at a Credit Card item:
 
 ```sh
-export PAYMENT_SOURCE=1password
-export PAYMENT_1PASSWORD_VAULT=Private          # optional when item names are unique
-export PAYMENT_1PASSWORD_ITEM="Personal Visa"   # becomes the `default` profile
+export PAYMENT_1PASSWORD_VAULT=Private               # optional when item names are unique
+export PAYMENT_1PASSWORD_ITEM="Personal Visa"        # becomes the `default` profile
+export PAYMENT_1PASSWORD_ADDRESS_ITEM="Home Address" # optional Identity/address item for billing + shipping
 cargo run -- chat
 ```
 
-For multiple payment profiles:
+Use separate address items when billing and shipping differ:
 
 ```sh
-export PAYMENT_SOURCE=1password
-export PAYMENT_1PASSWORD_ITEMS='{"default":"Personal Visa","backup":"Backup Mastercard"}'
+export PAYMENT_1PASSWORD_ITEM="Personal Visa"
+export PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM="Billing Address"
+export PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM="Shipping Address"
 ```
 
-`PAYMENT_1PASSWORD_ITEM` / `PAYMENT_1PASSWORD_ITEMS` can use item titles or IDs supported by `op item get`. Emissary runs `op item get --format json --reveal`, reads the card number, expiry, CVC/CVV, cardholder name, and postal/ZIP fields, and only exposes the profile keys to the LLM.
-
-To seed manually instead:
+For multiple profiles, use a JSON object. A string is shorthand for a card item; an object can provide card and address items:
 
 ```sh
-mkdir -p .agent-runtime
-cp examples/payment.json.example .agent-runtime/payment.json
-chmod 600 .agent-runtime/payment.json
+export PAYMENT_1PASSWORD_ITEMS='{
+  "default": {
+    "card": "Personal Visa",
+    "billingAddress": "Billing Address",
+    "shippingAddress": "Shipping Address"
+  },
+  "backup": "Backup Mastercard"
+}'
 ```
+
+`PAYMENT_1PASSWORD_ITEM` / `PAYMENT_1PASSWORD_ITEMS` can use item titles or IDs supported by `op item get`. Emissary runs `op item get --format json --reveal`, reads card and address fields into an in-process vault, and only exposes profile keys plus filled field names to the LLM.
 
 Type `exit` or press Ctrl+C to stop. Xvfb, VNC, websockify, and Chrome are stopped with the harness.
 
@@ -74,11 +78,12 @@ cargo run -- stop
 | `VENICE_TIMEOUT_SECS` | `300` | total timeout for each Venice chat completion request |
 | `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file + review screenshots |
 | `EMISSARY_IMAGE_DISPLAY` | `auto` | image preview mode: `auto`, `inline`, `path`, or `off` |
-| `PAYMENT_SOURCE` | `file` | payment source: `file` or `1password` |
-| `PAYMENT_FILE` | `.agent-runtime/payment.json` | payment vault |
 | `PAYMENT_1PASSWORD_ITEM` | unset | 1Password item title/ID to load as the `default` payment profile |
-| `PAYMENT_1PASSWORD_ITEMS` | unset | JSON object of profile keys to 1Password item titles/IDs |
+| `PAYMENT_1PASSWORD_ITEMS` | unset | JSON object of profile keys to 1Password item specs |
 | `PAYMENT_1PASSWORD_PROFILE` | `default` | profile key for `PAYMENT_1PASSWORD_ITEM` |
+| `PAYMENT_1PASSWORD_ADDRESS_ITEM` | unset | optional Identity/address item used for both billing and shipping |
+| `PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM` | unset | optional billing Identity/address item |
+| `PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM` | unset | optional shipping Identity/address item |
 | `PAYMENT_1PASSWORD_VAULT` | unset | optional 1Password vault passed to `op item get --vault` |
 | `OP_CLI` | `op` | 1Password CLI executable |
 | `CHROME` | auto-detect | Chromium/Chrome binary path |
@@ -149,26 +154,18 @@ When checkout needs you:
 - **`mode: review`** — order summary + basket/page screenshot in terminal when supported, plus a saved PNG path; open `handoff_url` only to submit
 - **`mode: interactive`** — bank/app auth (e.g. Lloyds); use `handoff_url`, then tell Emissary you're done so it sends `{ "op": "resume" }`
 
-Payment secrets stay in the vault. Wrong card details are tolerable; blocked submits and bank 2FA are not.
+Payment and address secrets stay in the vault. Wrong card details are tolerable; blocked submits and bank 2FA are not.
 
-## Payment vault
+## Credential vault
 
-Local JSON mode (`PAYMENT_SOURCE=file`) uses this shape:
+Emissary does not support local JSON files for credit card or checkout address credentials. Configure one of:
 
-```json
-{
-  "default": {
-    "card_number": "4242424242424242",
-    "exp_month": "12",
-    "exp_year": "2028",
-    "cvc": "123",
-    "name": "Jane Doe",
-    "postal_code": "94107"
-  }
-}
-```
+- `PAYMENT_1PASSWORD_ITEM` for a single default profile.
+- `PAYMENT_1PASSWORD_ITEMS` for multiple profile keys.
 
-1Password mode (`PAYMENT_SOURCE=1password`) works with standard Credit Card items. Custom fields are also supported when they are named `card_number`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`; a combined `exp`/`expiry` value such as `12/2028` can be used instead of separate month and year fields.
+Credit card items can use standard 1Password Credit Card fields. Custom payment fields are also supported when named `card_number`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`; a combined `exp`/`expiry` value such as `12/2028` can be used instead of separate month and year fields.
+
+Shipping and billing address data can live in the same item or in separate Identity/address items. Supported address field names include `full_name`, `first_name`, `last_name`, `organization`, `email`, `phone`, `address_line1`, `address_line2`, `city`, `region`/`state`, `postal_code`, and `country`; prefix with `shipping_` or `billing_` to scope a field.
 
 ## Commands
 
