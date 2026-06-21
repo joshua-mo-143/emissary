@@ -485,9 +485,13 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          - If pageState is bot_challenge or mode is blocked, stop retrying automation. Ask whether to use another site, continue manually in a normal browser, or retry after the user has cleared Cloudflare outside the harness.\n\
          Payment:\n\
          - Never put card numbers, CVV, or any payment secret values in tool arguments.\n\
+         - Review the basket/order summary before entering payment when checkout flow allows it.\n\
+         - Once payment/card fields are visible, do not call screenshot, html, text, or observe to inspect them. \
+         Use autoFillPaymentAndContinue with the chosen profile so the runtime fills the vault-backed fields \
+         and clicks only a guarded non-final continue/next/checkout control without model-selected fields or buttons.\n\
          - For checkout fields, first use observe, then map visible input refs to vault credential IDs with fillPaymentRefs. \
          Send IDs like `default:card_number`, `default:exp`, `default:exp_month`, `default:exp_year`, `default:cvc`, `default:name`, and `default:postal_code`; never send the values. Loaded profiles: {profiles}.\n\
-         - Use fillPayment only as a fallback when refs are unavailable.\n\
+         - Use fillPayment/fillPaymentRefs only as fallbacks when autoFillPaymentAndContinue is not appropriate.\n\
          Images:\n\
          - When the user asks about appearance, product photos, or wants to buy a specific item, use screenshot before checkout when helpful. \
          Prefer a selector for the product image/card when available; otherwise capture the visible page.\n\

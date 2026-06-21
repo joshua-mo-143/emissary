@@ -63,6 +63,8 @@ pub enum Action {
     },
     /// Fill one payment field by selector and vault credential ID.
     FillPaymentField { selector: String, field: String },
+    /// Fill payment by profile and click a safe non-final continue/next/checkout control.
+    AutoFillPaymentAndContinue { profile: String },
     /// Capture a safe product/page screenshot for the user.
     Screenshot {
         #[serde(default)]
@@ -356,6 +358,14 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
         }
+        Action::AutoFillPaymentAndContinue { profile } => {
+            let result = PaymentVault::fill_payment_and_continue(tab, context.payment, profile)
+                .map_err(|_| review::handoff_required(HandoffReason::manual()))?;
+            if review::page_needs_interactive_auth(tab)? {
+                return Err(review::handoff_required(HandoffReason::auth_challenge()));
+            }
+            Ok(result)
+        }
         Action::Screenshot { selector } => Ok(json!(review::capture_safe_page_screenshot(
             tab,
             selector.as_deref()
@@ -399,6 +409,7 @@ fn op_name(action: &Action) -> &'static str {
         Action::FillPayment { .. } => "fillPayment",
         Action::FillPaymentRefs { .. } => "fillPaymentRefs",
         Action::FillPaymentField { .. } => "fillPaymentField",
+        Action::AutoFillPaymentAndContinue { .. } => "autoFillPaymentAndContinue",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
         Action::Handoff => "handoff",
@@ -436,6 +447,9 @@ fn action_detail(action: &Action) -> String {
         }
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
+        }
+        Action::AutoFillPaymentAndContinue { profile } => {
+            format!("autoFillPaymentAndContinue profile={profile}")
         }
         Action::Screenshot { selector } => match selector {
             Some(selector) => format!("screenshot selector={selector:?}"),
@@ -907,6 +921,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_auto_payment_continue_action() {
+        let request: RunRequest = serde_json::from_str(
+            r#"{"actions":[{"op":"autoFillPaymentAndContinue","profile":"default"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request.actions[0],
+            Action::AutoFillPaymentAndContinue { .. }
+        ));
+    }
+
+    #[test]
     fn parses_web_search_action() {
         let request: RunRequest =
             serde_json::from_str(r#"{"actions":[{"op":"webSearch","query":"Ada Lovelace"}]}"#)
@@ -930,12 +956,13 @@ mod tests {
                     { "op": "navigate", "url": "https://example.com" },
                     { "op": "click", "selector": "#checkout" },
                     { "op": "fillPayment", "profile": "default" },
+                    { "op": "autoFillPaymentAndContinue", "profile": "default" },
                     { "op": "review" }
                 ]
             }"##,
         )
         .unwrap();
-        assert_eq!(request.actions.len(), 4);
+        assert_eq!(request.actions.len(), 5);
         assert!(matches!(request.actions[1], Action::Click { .. }));
     }
 }
