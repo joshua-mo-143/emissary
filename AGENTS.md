@@ -17,7 +17,7 @@ src/
 Runtime data (gitignored):
 
 - `automation-profile/` — persistent Chrome profile
-- `.agent-runtime/` — `daemon.lock`, `payment.json` (auto-created on first run), `review-latest.png`
+- `.agent-runtime/` — `daemon.lock`, `payment.json` (auto-created on first run), review/page screenshot PNGs
 - `examples/payment.json.example` — reference copy of the payment vault shape
 
 ## Commands
@@ -39,6 +39,7 @@ Runtime data (gitignored):
 | `CHROME` | no | auto-detect Chromium |
 | `PAYMENT_FILE` | no | `.agent-runtime/payment.json` |
 | `EMISSARY_RUNTIME_DIR` | no | `.agent-runtime` |
+| `EMISSARY_IMAGE_DISPLAY` | no | `auto` |
 
 Venice is OpenAI-compatible; the harness calls `/chat/completions` with tool calling.
 
@@ -101,6 +102,8 @@ Follow these conventions when editing this repo.
 **Add a browser action:** extend `Action` in `actions.rs`, handle it in `execute_action`, update `tool_schema()`, README, and this file.
 
 **Browser interaction style:** prefer `observe` -> `clickRef` / `typeRef` for normal browsing. `observe` assigns stable `data-emissary-ref` IDs to visible controls and returns them as `elements`, which avoids brittle model-invented CSS selectors. Keep direct `click` / `type` for simple known selectors or tests.
+
+**Image previews:** use `screenshot` for product/page previews before checkout and `review` for basket/order-summary captures. Product/page screenshots must refuse to run when visible payment fields are present; order review screenshots must stay scoped away from payment UI. Terminal inline rendering is a default Cargo feature (`terminal-images`) with saved PNG path fallback.
 
 **Change LLM provider:** edit `LlmConfig` in `harness.rs`; keep OpenAI-compatible chat completions + tools unless the provider requires otherwise.
 

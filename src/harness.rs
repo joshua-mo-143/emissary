@@ -1,12 +1,11 @@
 use crate::actions::{Action, BrowserToolArguments};
 use crate::daemon::{ManagedDaemon, install_shutdown_handler, runtime_dir};
+use crate::image_display::{self, InlineImageResult};
 use crate::payment::PaymentVault;
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    fs,
     io::{self, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -305,6 +304,8 @@ fn run_agent_turn(
                         } else if response.is_error() {
                             show_browser_error_to_user(response.body());
                             stop_after_tool_error = true;
+                        } else {
+                            show_browser_images_to_user(response.body(), runtime_dir)?;
                         }
                         format_tool_result_for_model(response.body())
                     }
@@ -394,6 +395,10 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          Payment:\n\
          - Never put card numbers or CVV in tool arguments.\n\
          - Use fillPayment with a profile key when checkout needs card details. Loaded profiles: {profiles}.\n\
+         Images:\n\
+         - When the user asks about appearance, product photos, or wants to buy a specific item, use screenshot before checkout when helpful. \
+         Prefer a selector for the product image/card when available; otherwise capture the visible page.\n\
+         - Screenshots are shown to the user separately and omitted from model context. Do not reproduce base64.\n\
          Human handoff:\n\
          - Final purchase submits are blocked by the runtime.\n\
          - When the tool returns needs_human with mode review, summarize the basket/total for the user. \
@@ -419,18 +424,25 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         println!("\n--- Order review ---\n{summary}");
     }
 
+    if let Some(note) = body
+        .pointer("/review/review_note")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        println!("\n[review] {note}");
+    }
+
     if let Some(screenshot) = body
         .pointer("/review/screenshot_base64")
         .and_then(Value::as_str)
         .filter(|data| !data.is_empty())
     {
-        let png = BASE64
-            .decode(screenshot)
-            .context("failed to decode review screenshot")?;
-        fs::create_dir_all(runtime_dir)?;
-        let path = runtime_dir.join("review-latest.png");
-        fs::write(&path, png)?;
-        println!("\nScreenshot saved: {}", path.display());
+        show_browser_image(
+            "Order review screenshot",
+            "review-latest.png",
+            screenshot,
+            runtime_dir,
+        )?;
     }
 
     if let Some(url) = body.get("handoff_url").and_then(Value::as_str) {
@@ -466,6 +478,114 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+struct BrowserImage {
+    label: String,
+    screenshot_base64: String,
+    order_summary: Option<String>,
+    note: Option<String>,
+}
+
+fn show_browser_images_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
+    let mut images = Vec::new();
+    collect_browser_images(body, &mut images);
+
+    for (index, image) in images.iter().enumerate() {
+        if let Some(summary) = image
+            .order_summary
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            println!("\n--- Order review ---\n{summary}");
+        }
+        if let Some(note) = image.note.as_deref().filter(|text| !text.trim().is_empty()) {
+            println!("\n[image] {note}");
+        }
+
+        let filename = if image.label == "Order review screenshot" {
+            "review-latest.png".to_owned()
+        } else if images.len() == 1 {
+            "screenshot-latest.png".to_owned()
+        } else {
+            format!("screenshot-{}.png", index + 1)
+        };
+        show_browser_image(
+            &image.label,
+            &filename,
+            &image.screenshot_base64,
+            runtime_dir,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_browser_images(value: &Value, images: &mut Vec<BrowserImage>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(screenshot) = map
+                .get("screenshot_base64")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+            {
+                images.push(BrowserImage {
+                    label: browser_image_label(map),
+                    screenshot_base64: screenshot.to_owned(),
+                    order_summary: map
+                        .get("order_summary")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    note: map
+                        .get("review_note")
+                        .or_else(|| map.get("screenshot_note"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+                return;
+            }
+
+            for nested in map.values() {
+                collect_browser_images(nested, images);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_browser_images(item, images);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn browser_image_label(map: &Map<String, Value>) -> String {
+    if map.contains_key("review_scope") {
+        return "Order review screenshot".to_owned();
+    }
+
+    match map.get("screenshot_scope").and_then(Value::as_str) {
+        Some("selected_element") => "Selected page screenshot".to_owned(),
+        Some("page_viewport") => "Page screenshot".to_owned(),
+        Some(scope) => format!("{scope} screenshot"),
+        None => "Browser screenshot".to_owned(),
+    }
+}
+
+fn show_browser_image(
+    label: &str,
+    filename: &str,
+    screenshot_base64: &str,
+    runtime_dir: &PathBuf,
+) -> Result<()> {
+    println!("\n--- {label} ---");
+    let path = image_display::save_base64_png(runtime_dir, filename, screenshot_base64)?;
+    match image_display::render_inline(&path) {
+        InlineImageResult::Rendered => {}
+        InlineImageResult::Skipped => {}
+        InlineImageResult::Failed(error) => eprintln!("[image] inline render failed: {error}"),
+    }
+    println!("Image saved: {}", path.display());
     Ok(())
 }
 

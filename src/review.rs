@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use headless_chrome::{Tab, protocol::cdp::Page::CaptureScreenshotFormatOption};
 use serde::Serialize;
@@ -185,6 +185,17 @@ pub struct OrderReview {
     pub review_note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserScreenshot {
+    pub screenshot_scope: &'static str,
+    pub screenshot_base64: String,
+    pub screenshot_mime: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_note: Option<String>,
+}
+
 pub fn page_needs_bot_challenge(tab: &Tab) -> Result<bool> {
     let js = r###"(() => ({
         text: ((document.body && document.body.innerText) || "").slice(0, 12000),
@@ -264,6 +275,63 @@ pub fn is_auth_challenge_text(text: &str) -> bool {
             && (lower.contains("enter") || lower.contains("code") || lower.contains("sent"))
 }
 
+fn ensure_no_visible_payment_ui(tab: &Tab) -> Result<()> {
+    if page_has_visible_payment_ui(tab)? {
+        bail!(
+            "refusing page screenshot because visible payment fields are present; use review for an order-summary-only capture"
+        );
+    }
+    Ok(())
+}
+
+fn page_has_visible_payment_ui(tab: &Tab) -> Result<bool> {
+    let js = r#"(() => {
+        const paymentField = /cc-|card|cvc|cvv|security code|expiry|expiration|cardholder|name on card|billing postal|billing zip/i;
+        const paymentText = /card number|cvv|cvc|security code|expiry|expiration date|name on card/i;
+
+        function visible(el) {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 1 &&
+                rect.height > 1 &&
+                rect.bottom >= 0 &&
+                rect.right >= 0 &&
+                rect.top <= innerHeight &&
+                rect.left <= innerWidth &&
+                style.visibility !== "hidden" &&
+                style.display !== "none" &&
+                style.opacity !== "0";
+        }
+
+        for (const el of document.querySelectorAll("input, textarea, select, [contenteditable='true']")) {
+            if (!visible(el)) continue;
+            const hay = [
+                el.getAttribute("autocomplete"),
+                el.getAttribute("name"),
+                el.getAttribute("id"),
+                el.getAttribute("aria-label"),
+                el.getAttribute("placeholder")
+            ].filter(Boolean).join(" ");
+            if (paymentField.test(hay)) return true;
+        }
+
+        for (const el of document.querySelectorAll("form, section, aside, [role='form'], [data-testid], [class*='payment'], [id*='payment']")) {
+            if (!visible(el)) continue;
+            const text = (el.innerText || "").slice(0, 2000);
+            if (paymentText.test(text) && el.querySelector("input, textarea, select, [contenteditable='true']")) {
+                return true;
+            }
+        }
+
+        return false;
+    })()"#;
+    Ok(tab
+        .evaluate(js, false)?
+        .value
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
 pub fn capture_order_review(tab: &Tab) -> Result<OrderReview> {
     if page_needs_interactive_auth(tab)? {
         return Err(handoff_required(HandoffReason::auth_challenge()));
@@ -271,6 +339,19 @@ pub fn capture_order_review(tab: &Tab) -> Result<OrderReview> {
 
     let target = find_order_review_target(tab)?;
     let Some(target) = target else {
+        if let Ok(screenshot) = capture_safe_page_screenshot(tab, None) {
+            return Ok(OrderReview {
+                review_scope: "page_viewport",
+                order_summary: None,
+                screenshot_base64: Some(screenshot.screenshot_base64),
+                screenshot_mime: Some("image/png"),
+                review_note: Some(
+                    "could not locate basket or order summary; captured the visible page instead"
+                        .to_owned(),
+                ),
+            });
+        }
+
         return Ok(OrderReview {
             review_scope: "order_summary",
             order_summary: None,
@@ -290,6 +371,42 @@ pub fn capture_order_review(tab: &Tab) -> Result<OrderReview> {
         screenshot_base64: Some(screenshot_base64),
         screenshot_mime: Some("image/png"),
         review_note: None,
+    })
+}
+
+pub fn capture_safe_page_screenshot(
+    tab: &Tab,
+    selector: Option<&str>,
+) -> Result<BrowserScreenshot> {
+    if page_needs_interactive_auth(tab)? {
+        return Err(handoff_required(HandoffReason::auth_challenge()));
+    }
+    ensure_no_visible_payment_ui(tab)?;
+
+    let (png, scope, normalized_selector) = match selector.map(str::trim).filter(|s| !s.is_empty())
+    {
+        Some(selector) => {
+            let png = tab
+                .wait_for_element(selector)
+                .with_context(|| format!("screenshot target `{selector}` was not found"))?
+                .capture_screenshot(CaptureScreenshotFormatOption::Png)
+                .context("failed to capture selected page screenshot")?;
+            (png, "selected_element", Some(selector.to_owned()))
+        }
+        None => {
+            let png = tab
+                .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
+                .context("failed to capture page screenshot")?;
+            (png, "page_viewport", None)
+        }
+    };
+
+    Ok(BrowserScreenshot {
+        screenshot_scope: scope,
+        screenshot_base64: BASE64.encode(png),
+        screenshot_mime: "image/png",
+        selector: normalized_selector,
+        screenshot_note: None,
     })
 }
 
@@ -515,8 +632,8 @@ fn is_payment_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffPayload, HandoffReason, handoff_reason, handoff_required, is_auth_challenge_text,
-        is_bot_challenge_text, sanitize_summary_text,
+        BrowserScreenshot, HandoffPayload, HandoffReason, handoff_reason, handoff_required,
+        is_auth_challenge_text, is_bot_challenge_text, sanitize_summary_text,
     };
 
     #[test]
@@ -581,5 +698,20 @@ mod tests {
     fn extracts_typed_handoff_reason_from_error() {
         let error = handoff_required(HandoffReason::manual());
         assert_eq!(handoff_reason(&error), Some(HandoffReason::Manual));
+    }
+
+    #[test]
+    fn serializes_page_screenshot_shape() {
+        let screenshot = BrowserScreenshot {
+            screenshot_scope: "page_viewport",
+            screenshot_base64: "abc".to_owned(),
+            screenshot_mime: "image/png",
+            selector: None,
+            screenshot_note: None,
+        };
+        let value = serde_json::to_value(screenshot).unwrap();
+        assert_eq!(value["screenshot_scope"], "page_viewport");
+        assert_eq!(value["screenshot_mime"], "image/png");
+        assert!(value.get("selector").is_none());
     }
 }
