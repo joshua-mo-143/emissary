@@ -44,8 +44,8 @@ pub fn chat() -> Result<()> {
     };
     if payment_keys.is_empty() {
         eprintln!(
-            "warning: no payment profiles loaded; edit {}",
-            PaymentVault::payment_file_path().display()
+            "warning: no payment profiles loaded; {}",
+            PaymentVault::configuration_hint()
         );
     }
 
@@ -483,6 +483,10 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          Errors:\n\
          - If an action fails (missing element, invalid selector, etc.), the tool returns status error with pageText so you can adjust and retry.\n\
          - If pageState is bot_challenge or mode is blocked, stop retrying automation. Ask whether to use another site, continue manually in a normal browser, or retry after the user has cleared Cloudflare outside the harness.\n\
+         Credentials:\n\
+         - Never put card numbers, CVV, shipping address, billing address, email, or phone in tool arguments.\n\
+         - Use fillPayment with a profile key when checkout needs card details.\n\
+         - Use fillAddress with kind `shipping` or `billing` when checkout needs address/contact fields. Loaded profiles: {profiles}.\n\
          Payment:\n\
          - Never put card numbers, CVV, or any payment secret values in tool arguments.\n\
          - Review the basket/order summary before entering payment when checkout flow allows it.\n\

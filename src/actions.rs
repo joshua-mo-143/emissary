@@ -1,5 +1,5 @@
 use crate::payment::{
-    PaymentFieldMapping, PaymentVault, block_type_on_payment_field, is_sensitive_submit,
+    PaymentFieldMapping, PaymentVault, block_type_on_credential_field, is_sensitive_submit,
 };
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
@@ -14,22 +14,33 @@ use std::{sync::Arc, thread, time::Duration};
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Action {
     /// Search DuckDuckGo Instant Answer for facts and entities without using the browser.
-    WebSearch { query: String },
+    WebSearch {
+        query: String,
+    },
     /// Navigate the browser to a URL.
-    Navigate { url: String },
+    Navigate {
+        url: String,
+    },
     /// Return visible page text and stable refs for clickable/input elements.
     Observe,
     /// Click a visible element by CSS selector, or XPath when the selector starts with //.
-    Click { selector: String },
+    Click {
+        selector: String,
+    },
     /// Click an element ref returned by observe/current page elements.
     ClickRef {
         #[serde(rename = "refId")]
         ref_id: String,
     },
     /// Click a button or link by visible label text.
-    ClickText { text: String },
+    ClickText {
+        text: String,
+    },
     /// Type text into a selector. Do not use for payment fields.
-    Type { selector: String, text: String },
+    Type {
+        selector: String,
+        text: String,
+    },
     /// Type text into an observed element ref. Do not use for payment fields.
     TypeRef {
         #[serde(rename = "refId")]
@@ -37,9 +48,13 @@ pub enum Action {
         text: String,
     },
     /// Press a keyboard key such as Enter or Tab.
-    Press { key: String },
+    Press {
+        key: String,
+    },
     /// Wait for a CSS selector or XPath to become visible.
-    Wait { selector: String },
+    Wait {
+        selector: String,
+    },
     /// Return the current page title.
     Title,
     /// Return innerText for a selector, defaulting to body.
@@ -53,19 +68,36 @@ pub enum Action {
         selector: String,
     },
     /// Evaluate JavaScript in the page.
-    Eval { expression: String },
+    Eval {
+        expression: String,
+    },
     /// Legacy automatic payment form fill by profile key. Prefer observe -> fillPaymentRefs.
-    FillPayment { profile: String },
+    FillPayment {
+        profile: String,
+    },
     /// Fill payment fields by observed element refs and vault credential IDs.
     FillPaymentRefs {
         #[schemars(length(min = 1))]
         fields: Vec<PaymentFieldMapping>,
     },
     /// Fill one payment field by selector and vault credential ID.
-    FillPaymentField { selector: String, field: String },
-    /// Fill payment by profile and click a safe non-final continue/next/checkout control.
-    AutoFillPaymentAndContinue { profile: String },
-    /// Capture a safe product/page screenshot for the user.
+    FillPaymentField {
+        selector: String,
+        field: String,
+    },
+    /// Fill detected payment fields and guardedly continue to the next checkout step.
+    AutoFillPaymentAndContinue {
+        profile: String,
+    },
+    FillAddress {
+        profile: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
+    FillAddressField {
+        selector: String,
+        field: String,
+    },
     Screenshot {
         #[serde(default)]
         selector: Option<String>,
@@ -323,14 +355,14 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::Type { selector, text } => {
             let element = wait_for_target(tab, selector)
                 .map_err(|error| enrich_selector_error(selector, error))?;
-            block_type_on_payment_field(tab, selector)?;
+            block_type_on_credential_field(tab, selector)?;
             element.click()?;
             tab.type_str(text)?;
             Ok(json!({ "selector": selector, "typed": text }))
         }
         Action::TypeRef { ref_id, text } => {
-            if element_ref_is_payment_field(tab, ref_id)? {
-                bail!("payment field must use fill_payment or fill_payment_field");
+            if element_ref_is_credential_field(tab, ref_id)? {
+                bail!("credential fields must use fillPayment/fillAddress vault actions");
             }
             type_by_ref(tab, ref_id, text)
         }
@@ -357,6 +389,12 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         }
         Action::FillPaymentField { selector, field } => {
             PaymentVault::fill_payment_field(tab, context.payment, selector, field)
+        }
+        Action::FillAddress { profile, kind } => {
+            PaymentVault::fill_address(tab, context.payment, profile, kind.as_deref())
+        }
+        Action::FillAddressField { selector, field } => {
+            PaymentVault::fill_address_field(tab, context.payment, selector, field)
         }
         Action::AutoFillPaymentAndContinue { profile } => {
             let result = PaymentVault::fill_payment_and_continue(tab, context.payment, profile)
@@ -409,6 +447,8 @@ fn op_name(action: &Action) -> &'static str {
         Action::FillPayment { .. } => "fillPayment",
         Action::FillPaymentRefs { .. } => "fillPaymentRefs",
         Action::FillPaymentField { .. } => "fillPaymentField",
+        Action::FillAddress { .. } => "fillAddress",
+        Action::FillAddressField { .. } => "fillAddressField",
         Action::AutoFillPaymentAndContinue { .. } => "autoFillPaymentAndContinue",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
@@ -447,6 +487,12 @@ fn action_detail(action: &Action) -> String {
         }
         Action::FillPaymentField { selector, field } => {
             format!("fillPaymentField selector={selector:?} field={field}")
+        }
+        Action::FillAddress { profile, kind } => {
+            format!("fillAddress profile={profile} kind={kind:?}")
+        }
+        Action::FillAddressField { selector, field } => {
+            format!("fillAddressField selector={selector:?} field={field}")
         }
         Action::AutoFillPaymentAndContinue { profile } => {
             format!("autoFillPaymentAndContinue profile={profile}")
@@ -761,7 +807,7 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
     }
 }
 
-fn element_ref_is_payment_field(tab: &Tab, ref_id: &str) -> Result<bool> {
+fn element_ref_is_credential_field(tab: &Tab, ref_id: &str) -> Result<bool> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
         r##"(() => {{
@@ -769,14 +815,15 @@ fn element_ref_is_payment_field(tab: &Tab, ref_id: &str) -> Result<bool> {
             const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
                 .find((candidate) => candidate.dataset.emissaryRef === refId);
             if (!el) return false;
+            const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
+            if (/^(cc-|shipping |billing )/.test(autocomplete)) return true;
             const hay = [
-                el.getAttribute("autocomplete"),
                 el.getAttribute("name"),
                 el.getAttribute("id"),
                 el.getAttribute("aria-label"),
                 el.getAttribute("placeholder")
             ].filter(Boolean).join(" ").toLowerCase();
-            return /cc-|card|cvc|cvv|security code|expiry|expiration/.test(hay);
+            return /cc-|card|cvc|cvv|security code|expiry|expiration|postal|postcode|zip|address|street|city|state|province|country|phone|email/.test(hay);
         }})()"##
     );
     Ok(tab
@@ -946,6 +993,19 @@ mod tests {
             serde_json::from_str(r#"{"actions":[{"op":"screenshot","selector":"img.product"}]}"#)
                 .unwrap();
         assert!(matches!(request.actions[0], Action::Screenshot { .. }));
+    }
+
+    #[test]
+    fn parses_address_fill_actions() {
+        let request: RunRequest = serde_json::from_str(
+            r##"{"actions":[{"op":"fillAddress","profile":"default","kind":"billing"},{"op":"fillAddressField","selector":"#zip","field":"default:shipping.postal_code"}]}"##,
+        )
+        .unwrap();
+        assert!(matches!(request.actions[0], Action::FillAddress { .. }));
+        assert!(matches!(
+            request.actions[1],
+            Action::FillAddressField { .. }
+        ));
     }
 
     #[test]
