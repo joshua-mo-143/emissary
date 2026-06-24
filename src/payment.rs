@@ -7,6 +7,8 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 const PAYMENT_FILE_ENV: &str = "PAYMENT_FILE";
@@ -97,6 +99,18 @@ const NAVIGATE_PATTERNS: &[&str] = &[
     "view checkout",
 ];
 
+const SAFE_PAYMENT_CONTINUE_PATTERNS: &[&str] = &[
+    "continue",
+    "next",
+    "checkout",
+    "review order",
+    "review your order",
+    "confirm details",
+    "use this card",
+    "save card",
+    "save and continue",
+];
+
 pub struct SecretString(String);
 
 impl SecretString {
@@ -139,6 +153,15 @@ pub struct PaymentFieldMapping {
     pub ref_id: String,
     /// Vault credential ID, e.g. default:card_number, default:exp, default:cvc, default:name, or default:postal_code.
     pub field: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaymentContinueCandidate {
+    #[serde(rename = "refId")]
+    ref_id: String,
+    label: String,
+    details: String,
+    tag: String,
 }
 
 impl PaymentVault {
@@ -270,6 +293,35 @@ impl PaymentVault {
             "into": css,
         }))
     }
+
+    pub fn fill_payment_and_continue(
+        tab: &Tab,
+        vault: &PaymentVault,
+        profile_key: &str,
+    ) -> Result<Value> {
+        let filled = Self::fill_payment(tab, vault, profile_key)?;
+        let candidates = payment_continue_candidates(tab)?;
+        let selected = candidates
+            .iter()
+            .find(|candidate| {
+                is_safe_payment_continue(&candidate.label)
+                    && !is_sensitive_submit(&candidate.details)
+            })
+            .ok_or_else(|| continue_selection_error(&candidates))?;
+
+        let clicked = click_payment_continue_ref(tab, &selected.ref_id)?;
+        thread::sleep(Duration::from_millis(750));
+
+        Ok(json!({
+            "filled_payment": filled.get("filled_payment").cloned().unwrap_or_else(|| json!(profile_key)),
+            "fields": filled.get("fields").cloned().unwrap_or_else(|| json!([])),
+            "continued": {
+                "label": selected.label,
+                "tag": selected.tag,
+                "clicked": clicked.get("clicked").cloned().unwrap_or_else(|| json!(true)),
+            }
+        }))
+    }
 }
 
 impl PaymentVault {
@@ -329,11 +381,149 @@ pub fn is_sensitive_submit(details: &str) -> bool {
     trimmed == "pay" || trimmed.starts_with("pay ") || trimmed.starts_with("pay\n")
 }
 
+pub fn is_safe_payment_continue(details: &str) -> bool {
+    if is_sensitive_submit(details) {
+        return false;
+    }
+
+    let lower = details.to_lowercase();
+    SAFE_PAYMENT_CONTINUE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
 pub fn block_type_on_payment_field(tab: &Tab, css: &str) -> Result<()> {
     if element_is_payment_field(tab, css)? {
         bail!("payment field must use fill_payment or fill_payment_field");
     }
     Ok(())
+}
+
+fn continue_selection_error(candidates: &[PaymentContinueCandidate]) -> anyhow::Error {
+    let final_labels = candidates
+        .iter()
+        .filter(|candidate| {
+            is_sensitive_submit(&candidate.label) || is_sensitive_submit(&candidate.details)
+        })
+        .map(|candidate| candidate.label.trim())
+        .filter(|label| !label.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+
+    if final_labels.is_empty() {
+        anyhow!("payment filled, but no safe continue/next/checkout control was visible")
+    } else {
+        anyhow!(
+            "payment filled, but only final submit controls were visible: {}",
+            final_labels.join(", ")
+        )
+    }
+}
+
+fn payment_continue_candidates(tab: &Tab) -> Result<Vec<PaymentContinueCandidate>> {
+    let js = r##"(() => {
+        function visible(el) {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom >= 0 &&
+                rect.right >= 0 &&
+                rect.top <= innerHeight &&
+                rect.left <= innerWidth &&
+                style.visibility !== "hidden" &&
+                style.display !== "none" &&
+                style.opacity !== "0" &&
+                !el.disabled &&
+                el.getAttribute("aria-disabled") !== "true";
+        }
+
+        function clean(text) {
+            return String(text || "").replace(/\s+/g, " ").trim();
+        }
+
+        function labelFor(el) {
+            const bits = [
+                el.innerText,
+                el.textContent,
+                el.getAttribute("aria-label"),
+                el.getAttribute("title"),
+                el.getAttribute("value"),
+                el.getAttribute("name"),
+                el.id
+            ].map(clean).filter(Boolean);
+            return bits[0] || "";
+        }
+
+        const candidates = [];
+        let nextRef = 1;
+        for (const el of document.querySelectorAll("button, a[href], input[type='button'], input[type='submit'], [role='button']")) {
+            if (!visible(el)) continue;
+            const label = labelFor(el);
+            if (!label) continue;
+            const refId = `pc${nextRef++}`;
+            el.setAttribute("data-emissary-payment-continue-ref", refId);
+            const form = el.closest("form");
+            const details = [
+                label,
+                el.getAttribute("aria-label"),
+                el.getAttribute("title"),
+                el.getAttribute("value"),
+                el.getAttribute("name"),
+                el.id,
+                form && form.innerText
+            ].map(clean).filter(Boolean).join("\n").slice(0, 2000);
+            candidates.push({
+                refId,
+                label,
+                details,
+                tag: el.tagName.toLowerCase()
+            });
+        }
+        return JSON.stringify(candidates);
+    })()"##;
+    let raw = tab.evaluate(js, true)?.value.unwrap_or(Value::Null);
+    Ok(serde_json::from_str(&value_to_string(raw))?)
+}
+
+fn click_payment_continue_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
+    let ref_json = serde_json::to_string(ref_id)?;
+    let js = format!(
+        r##"(() => {{
+            const refId = {ref_json};
+            const el = document.querySelector(`[data-emissary-payment-continue-ref="${{refId}}"]`);
+            if (!el) {{
+                return JSON.stringify({{
+                    clicked: false,
+                    reason: "safe payment continue control disappeared"
+                }});
+            }}
+            el.scrollIntoView({{ block: "center", inline: "center" }});
+            el.click();
+            return JSON.stringify({{
+                clicked: true,
+                label: (el.innerText || el.textContent || el.getAttribute("value") || "").trim(),
+                tag: el.tagName.toLowerCase()
+            }});
+        }})()"##
+    );
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    let details: Value = serde_json::from_str(&value_to_string(raw))?;
+    if details
+        .get("clicked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(details)
+    } else {
+        bail!(
+            "{}",
+            details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("auto payment continue failed")
+        )
+    }
 }
 
 fn parse_field_ref(field_ref: &str) -> Result<(&str, &str)> {
@@ -575,7 +765,10 @@ fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaymentFieldMapping, PaymentVault, is_sensitive_submit, parse_field_ref};
+    use super::{
+        PaymentFieldMapping, PaymentVault, is_safe_payment_continue, is_sensitive_submit,
+        parse_field_ref,
+    };
     use std::fs;
 
     #[test]
@@ -591,6 +784,16 @@ mod tests {
         assert!(!is_sensitive_submit("Proceed to payment"));
         assert!(!is_sensitive_submit("Go to checkout"));
         assert!(!is_sensitive_submit("Checkout"));
+    }
+
+    #[test]
+    fn classifies_safe_payment_continue_controls() {
+        assert!(is_safe_payment_continue("Continue"));
+        assert!(is_safe_payment_continue("Next"));
+        assert!(is_safe_payment_continue("Checkout"));
+        assert!(is_safe_payment_continue("Continue to review order"));
+        assert!(!is_safe_payment_continue("Pay now"));
+        assert!(!is_safe_payment_continue("Complete purchase"));
     }
 
     #[test]

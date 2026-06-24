@@ -48,7 +48,7 @@ Venice is OpenAI-compatible; the harness calls `/chat/completions` with tool cal
 1. **Single Rust crate.** Do not add a TypeScript/Node harness or split runtimes without an explicit request.
 2. **Daemon lifetime = chat lifetime.** `ManagedDaemon` starts in `chat`, shuts down on `exit`, normal return, or Ctrl+C. Do not reintroduce a standalone `serve` workflow as the default path.
 3. **Browser tool is the capability boundary.** The LLM sends whitelisted JSON actions only (`Action` enum). No arbitrary JS eval from the model beyond the explicit `eval` action.
-4. **Secrets stay out of the LLM.** Payment data comes from `PaymentVault` keys (`fillPayment`), never from tool arguments or responses. Strip screenshot base64 before returning tool results to the model.
+4. **Secrets stay out of the LLM.** Payment data comes from `PaymentVault` keys (`fillPayment`, `autoFillPaymentAndContinue`), never from tool arguments or responses. Strip screenshot base64 before returning tool results to the model.
 5. **Handoff is intentional.** Final purchase clicks and bank 2FA pause automation and surface `needs_human` with basket review or `handoff_url`.
 6. **Review excludes payment UI.** `review` captures order summary regions only; do not screenshot card fields.
 
@@ -101,7 +101,7 @@ Follow these conventions when editing this repo.
 
 **Add a browser action:** extend `Action` in `actions.rs`, handle it in `execute_action`, update `tool_schema()`, README, and this file.
 
-**Payment field filling:** prefer `observe` -> `fillPaymentRefs` for checkout fields. The LLM maps observed input refs to vault credential IDs such as `default:card_number` or `default:cvc`; it must never send card values, CVV values, or other payment secret values in tool arguments. Keep `fillPayment` / `fillPaymentField` as fallbacks for cases where refs are unavailable.
+**Payment field filling:** review basket/order summaries before payment when possible, then prefer `autoFillPaymentAndContinue` once card fields are visible. That action fills detected fields from the vault and clicks only guarded non-final continue/next/checkout controls without LLM-selected payment fields or buttons. Keep `observe` -> `fillPaymentRefs`, `fillPayment`, and `fillPaymentField` as fallbacks; the LLM maps refs to vault credential IDs such as `default:card_number` or `default:cvc` and must never send card values, CVV values, or other payment secret values in tool arguments.
 
 **Browser interaction style:** prefer `observe` -> `clickRef` / `typeRef` for normal browsing. `observe` assigns stable `data-emissary-ref` IDs to visible controls and returns them as `elements`, which avoids brittle model-invented CSS selectors. Keep direct `click` / `type` for simple known selectors or tests.
 
