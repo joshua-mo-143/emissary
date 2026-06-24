@@ -28,24 +28,56 @@ cargo run -- chat
 
 Emissary auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
 
-Emissary loads checkout credentials only from 1Password. Install and sign in to the 1Password CLI (`op`), then point Emissary at a Credit Card item:
+Emissary can browse sites without any 1Password setup. Checkout credential automation is optional and, when enabled, loads credentials only from 1Password.
+
+### Optional 1Password Setup
+
+Configure 1Password only if you want Emissary to fill checkout payment or address fields.
+
+1. Install the 1Password CLI and sign in:
 
 ```sh
-export PAYMENT_1PASSWORD_VAULT=Private               # optional when item names are unique
-export PAYMENT_1PASSWORD_ITEM="Personal Visa"        # becomes the `default` profile
-export PAYMENT_1PASSWORD_ADDRESS_ITEM="Home Address" # optional Identity/address item for billing + shipping
+op account list
+op signin
+```
+
+2. Create or choose a 1Password **Credit Card** item for the card Emissary should use. Standard card fields work out of the box.
+
+3. Optional: create or choose an **Identity** item for checkout addresses. Use one shared address item, or separate billing and shipping items when they differ.
+
+4. Run the setup wizard and enter item titles or IDs when prompted:
+
+```sh
+cargo run -- setup
+```
+
+The setup wizard writes `.agent-runtime/1password.json`, which is gitignored. It stores only 1Password item references, not decrypted card or address values:
+
+```json
+{
+  "vault": "Private",
+  "card": "Personal Visa",
+  "address": "Home Address"
+}
+```
+
+Then start Emissary, or restart it if it is already running:
+
+```sh
 cargo run -- chat
 ```
 
-Use separate address items when billing and shipping differ:
+For separate billing and shipping addresses, leave the shared address blank or provide item refs for the separate prompts. The saved config will look like:
 
-```sh
-export PAYMENT_1PASSWORD_ITEM="Personal Visa"
-export PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM="Billing Address"
-export PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM="Shipping Address"
+```json
+{
+  "card": "Personal Visa",
+  "billingAddress": "Billing Address",
+  "shippingAddress": "Shipping Address"
+}
 ```
 
-For multiple profiles, use a JSON object. A string is shorthand for a card item; an object can provide card and address items:
+For multiple payment profiles or scripts, use env vars instead of the setup file. Env vars take precedence:
 
 ```sh
 export PAYMENT_1PASSWORD_ITEMS='{
@@ -58,7 +90,22 @@ export PAYMENT_1PASSWORD_ITEMS='{
 }'
 ```
 
-`PAYMENT_1PASSWORD_ITEM` / `PAYMENT_1PASSWORD_ITEMS` can use item titles or IDs supported by `op item get`. Emissary runs `op item get --format json --reveal`, reads card and address fields into an in-process vault, and only exposes profile keys plus filled field names to the LLM.
+The single-profile env var form is still supported:
+
+```sh
+export PAYMENT_1PASSWORD_VAULT=Private               # optional when item names are unique
+export PAYMENT_1PASSWORD_ITEM="Personal Visa"
+export PAYMENT_1PASSWORD_ADDRESS_ITEM="Home Address" # optional shared billing + shipping address
+```
+
+Before running a checkout, you can confirm the CLI can read the items:
+
+```sh
+op item get "Personal Visa" --format json --reveal
+op item get "Home Address" --format json
+```
+
+Do not commit secrets or decrypted item JSON. Emissary reads secrets directly from `op` when payment profiles are configured and keeps card/address values out of LLM prompts and tool results.
 
 Type `exit` or press Ctrl+C to stop. Xvfb, VNC, websockify, and Chrome are stopped with the harness.
 
@@ -190,7 +237,7 @@ Payment and address secrets stay in the vault. Wrong card details are tolerable;
 
 ## Credential vault
 
-Emissary does not support local JSON files for credit card or checkout address credentials. Configure one of:
+Emissary does not require a credential vault for browsing-only automation. If checkout payment or address filling is needed, it does not support local JSON files for those credentials; configure one of:
 
 - `PAYMENT_1PASSWORD_ITEM` for a single default profile.
 - `PAYMENT_1PASSWORD_ITEMS` for multiple profile keys.
@@ -204,6 +251,7 @@ Shipping and billing address data can live in the same item or in separate Ident
 | command | purpose |
 |---|---|
 | `chat` | start harness + daemon |
+| `setup` | configure gitignored 1Password item references |
 | `stop` | clean stale daemon lock/processes |
 | `schema` | print browser tool schema |
 | `run` | one-shot headless action batch |

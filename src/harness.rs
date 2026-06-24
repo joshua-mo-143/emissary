@@ -1,7 +1,6 @@
 use crate::actions::{Action, BrowserToolArguments};
 use crate::daemon::{ManagedDaemon, install_shutdown_handler, runtime_dir};
 use crate::image_display::{self, InlineImageResult};
-use crate::payment::PaymentVault;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -42,13 +41,6 @@ pub fn chat() -> Result<()> {
         let guard = shared.lock().expect("daemon mutex poisoned");
         guard.payment_keys()
     };
-    if payment_keys.is_empty() {
-        eprintln!(
-            "warning: no payment profiles loaded; {}",
-            PaymentVault::configuration_hint()
-        );
-    }
-
     let mut messages = vec![ChatMessage::system(system_prompt(&payment_keys, &status))];
     let tool = openai_tool(&schema);
     println!("Type a message, or 'exit' to quit.\n");
@@ -453,7 +445,7 @@ fn openai_tool(schema: &Value) -> Value {
 
 fn system_prompt(payment_keys: &[String], status: &Value) -> String {
     let profiles = if payment_keys.is_empty() {
-        "none loaded".to_owned()
+        "none loaded; payment/address vault actions are unavailable until the user configures 1Password".to_owned()
     } else {
         payment_keys
             .iter()
@@ -488,6 +480,7 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          - Never put card numbers, CVV, shipping address, billing address, email, or phone in tool arguments.\n\
          - Use fillPayment with a profile key when checkout needs card details.\n\
          - Use fillAddress with kind `shipping` or `billing` when checkout needs address/contact fields. Loaded profiles: {profiles}.\n\
+         - If no payment profile is loaded and a task needs checkout credentials, ask the user to run setup before continuing.\n\
          Payment:\n\
          - Never put card numbers, CVV, or any payment secret values in tool arguments.\n\
          - Review the basket/order summary before entering payment when checkout flow allows it.\n\

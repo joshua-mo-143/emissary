@@ -4,7 +4,7 @@ use headless_chrome::Tab;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, process::Command, thread, time::Duration};
+use std::{collections::HashMap, env, fs, path::PathBuf, process::Command, thread, time::Duration};
 
 const ONEPASSWORD_ITEM_ENV: &str = "PAYMENT_1PASSWORD_ITEM";
 const ONEPASSWORD_ITEMS_ENV: &str = "PAYMENT_1PASSWORD_ITEMS";
@@ -15,6 +15,9 @@ const ONEPASSWORD_BILLING_ADDRESS_ITEM_ENV: &str = "PAYMENT_1PASSWORD_BILLING_AD
 const ONEPASSWORD_VAULT_ENV: &str = "PAYMENT_1PASSWORD_VAULT";
 const ONEPASSWORD_CLI_ENV: &str = "OP_CLI";
 const DEFAULT_PAYMENT_PROFILE: &str = "default";
+const RUNTIME_DIR_ENV: &str = "EMISSARY_RUNTIME_DIR";
+const DEFAULT_RUNTIME_DIR: &str = ".agent-runtime";
+const ONEPASSWORD_CONFIG_FILE: &str = "1password.json";
 
 const CARD_NUMBER_SELECTORS: &[&str] = &[
     r#"[autocomplete="cc-number"]"#,
@@ -188,7 +191,30 @@ struct PaymentContinueCandidate {
 
 impl PaymentVault {
     pub fn load() -> Result<Self> {
-        Self::load_from_1password(onepassword_config()?)
+        match onepassword_config()? {
+            Some(config) => Self::load_from_1password(config),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn save_setup(setup: &OnePasswordSetup) -> Result<PathBuf> {
+        let config = onepassword_config_from_setup(setup)?;
+        Self::load_from_1password(config).context("failed to validate 1Password setup")?;
+
+        let path = onepassword_config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create setup config directory `{}`",
+                    parent.display()
+                )
+            })?;
+        }
+        let json =
+            serde_json::to_string_pretty(setup).context("failed to serialize 1Password setup")?;
+        fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write 1Password setup to `{}`", path.display()))?;
+        Ok(path)
     }
 
     fn load_from_1password(config: OnePasswordConfig) -> Result<Self> {
@@ -219,7 +245,7 @@ impl PaymentVault {
     }
 
     pub fn configuration_hint() -> String {
-        format!("set {ONEPASSWORD_ITEM_ENV} or {ONEPASSWORD_ITEMS_ENV}")
+        "payment actions require 1Password setup; run `cargo run -- setup` or set PAYMENT_1PASSWORD_ITEM/PAYMENT_1PASSWORD_ITEMS".to_owned()
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -228,11 +254,17 @@ impl PaymentVault {
         keys
     }
 
-    pub fn fill_payment(tab: &Tab, vault: &PaymentVault, profile_key: &str) -> Result<Value> {
-        let profile = vault
-            .profiles
+    fn profile(&self, profile_key: &str) -> Result<&PaymentProfile> {
+        if self.profiles.is_empty() {
+            bail!("{}", Self::configuration_hint());
+        }
+        self.profiles
             .get(profile_key)
-            .with_context(|| format!("unknown payment profile `{profile_key}`"))?;
+            .with_context(|| format!("unknown payment profile `{profile_key}`"))
+    }
+
+    pub fn fill_payment(tab: &Tab, vault: &PaymentVault, profile_key: &str) -> Result<Value> {
+        let profile = vault.profile(profile_key)?;
 
         let mut filled = Vec::new();
 
@@ -483,10 +515,7 @@ impl PaymentVault {
 
 impl PaymentVault {
     fn secret(&self, profile_key: &str, field_name: &str) -> Result<SecretString> {
-        let profile = self
-            .profiles
-            .get(profile_key)
-            .with_context(|| format!("unknown payment profile `{profile_key}`"))?;
+        let profile = self.profile(profile_key)?;
 
         let value = match field_name {
             "card_number" => profile.card_number.clone(),
@@ -509,10 +538,7 @@ impl PaymentVault {
     }
 
     fn address(&self, profile_key: &str, kind: AddressKind) -> Result<&AddressProfile> {
-        let profile = self
-            .profiles
-            .get(profile_key)
-            .with_context(|| format!("unknown payment profile `{profile_key}`"))?;
+        let profile = self.profile(profile_key)?;
         let address = match kind {
             AddressKind::Billing => &profile.billing_address,
             AddressKind::Shipping => &profile.shipping_address,
@@ -748,6 +774,28 @@ struct OnePasswordConfig {
     items: Vec<(String, OnePasswordProfileRefs)>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OnePasswordSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    #[serde(default)]
+    pub card: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(
+        default,
+        rename = "billingAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub billing_address: Option<String>,
+    #[serde(
+        default,
+        rename = "shippingAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shipping_address: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OnePasswordProfileRefs {
     payment: String,
@@ -862,26 +910,164 @@ enum OnePasswordProfileSpec {
     },
 }
 
-fn onepassword_config() -> Result<OnePasswordConfig> {
-    let items = parse_onepassword_items(
-        env::var(ONEPASSWORD_ITEMS_ENV).ok().as_deref(),
-        env::var(ONEPASSWORD_ITEM_ENV).ok().as_deref(),
-        env::var(ONEPASSWORD_PROFILE_ENV).ok().as_deref(),
-        env::var(ONEPASSWORD_ADDRESS_ITEM_ENV).ok().as_deref(),
-        env::var(ONEPASSWORD_BILLING_ADDRESS_ITEM_ENV)
-            .ok()
-            .as_deref(),
-        env::var(ONEPASSWORD_SHIPPING_ADDRESS_ITEM_ENV)
-            .ok()
-            .as_deref(),
-    )?;
-    let cli = env::var(ONEPASSWORD_CLI_ENV).unwrap_or_else(|_| "op".to_owned());
-    let vault = env::var(ONEPASSWORD_VAULT_ENV)
-        .ok()
-        .map(|vault| vault.trim().to_owned())
-        .filter(|vault| !vault.is_empty());
+#[derive(Deserialize)]
+struct OnePasswordFileConfig {
+    #[serde(default)]
+    vault: Option<String>,
+    #[serde(default)]
+    card: Option<String>,
+    #[serde(default)]
+    payment: Option<String>,
+    #[serde(default)]
+    item: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default, rename = "billingAddress")]
+    billing_address_camel: Option<String>,
+    #[serde(default)]
+    billing_address: Option<String>,
+    #[serde(default, rename = "shippingAddress")]
+    shipping_address_camel: Option<String>,
+    #[serde(default)]
+    shipping_address: Option<String>,
+    #[serde(default)]
+    profiles: Option<HashMap<String, OnePasswordProfileSpec>>,
+}
 
-    Ok(OnePasswordConfig { cli, vault, items })
+fn onepassword_config() -> Result<Option<OnePasswordConfig>> {
+    let cli = env::var(ONEPASSWORD_CLI_ENV).unwrap_or_else(|_| "op".to_owned());
+    let env_vault = env_onepassword_vault();
+    let items_json = env::var(ONEPASSWORD_ITEMS_ENV).ok();
+    let single_item = env::var(ONEPASSWORD_ITEM_ENV).ok();
+
+    if items_json.is_some() || single_item.is_some() {
+        let items = parse_onepassword_items(
+            items_json.as_deref(),
+            single_item.as_deref(),
+            env::var(ONEPASSWORD_PROFILE_ENV).ok().as_deref(),
+            env::var(ONEPASSWORD_ADDRESS_ITEM_ENV).ok().as_deref(),
+            env::var(ONEPASSWORD_BILLING_ADDRESS_ITEM_ENV)
+                .ok()
+                .as_deref(),
+            env::var(ONEPASSWORD_SHIPPING_ADDRESS_ITEM_ENV)
+                .ok()
+                .as_deref(),
+        )?;
+        return Ok(Some(OnePasswordConfig {
+            cli,
+            vault: env_vault,
+            items,
+        }));
+    }
+
+    let path = onepassword_config_path()?;
+    if path.exists() {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read 1Password setup from `{}`", path.display()))?;
+        let (file_vault, items) = parse_onepassword_file_config(&raw)
+            .with_context(|| format!("invalid 1Password setup in `{}`", path.display()))?;
+        return Ok(Some(OnePasswordConfig {
+            cli,
+            vault: env_vault.or(file_vault),
+            items,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn onepassword_config_from_setup(setup: &OnePasswordSetup) -> Result<OnePasswordConfig> {
+    let cli = env::var(ONEPASSWORD_CLI_ENV).unwrap_or_else(|_| "op".to_owned());
+    let card = setup.card.trim();
+    if card.is_empty() {
+        bail!("card item cannot be empty");
+    }
+    let address = trim_optional(setup.address.as_deref());
+    let billing_address =
+        trim_optional(setup.billing_address.as_deref()).or_else(|| address.clone());
+    let shipping_address =
+        trim_optional(setup.shipping_address.as_deref()).or_else(|| address.clone());
+    Ok(OnePasswordConfig {
+        cli,
+        vault: trim_optional(setup.vault.as_deref()),
+        items: vec![(
+            DEFAULT_PAYMENT_PROFILE.to_owned(),
+            OnePasswordProfileRefs {
+                payment: card.to_owned(),
+                billing_address,
+                shipping_address,
+            },
+        )],
+    })
+}
+
+fn parse_onepassword_file_config(
+    raw: &str,
+) -> Result<(Option<String>, Vec<(String, OnePasswordProfileRefs)>)> {
+    let file = serde_json::from_str::<OnePasswordFileConfig>(raw)
+        .context("setup file must be a JSON object")?;
+    let vault = trim_owned_optional(file.vault);
+    if let Some(profiles) = file.profiles {
+        let has_top_level_profile = file.card.is_some()
+            || file.payment.is_some()
+            || file.item.is_some()
+            || file.address.is_some()
+            || file.billing_address_camel.is_some()
+            || file.billing_address.is_some()
+            || file.shipping_address_camel.is_some()
+            || file.shipping_address.is_some();
+        if has_top_level_profile {
+            bail!("use either top-level profile fields or `profiles`, not both");
+        }
+        let mut items = Vec::new();
+        for (profile_key, spec) in profiles {
+            let profile_key = profile_key.trim().to_owned();
+            if profile_key.is_empty() {
+                bail!("profiles cannot contain empty profile keys");
+            }
+            items.push((profile_key, profile_refs_from_spec(spec)?));
+        }
+        if items.is_empty() {
+            bail!("profiles must contain at least one payment profile");
+        }
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        return Ok((vault, items));
+    }
+
+    let payment = require_item_ref(file.item.or(file.payment).or(file.card), "card item")?;
+    let address = trim_owned_optional(file.address);
+    Ok((
+        vault,
+        vec![(
+            DEFAULT_PAYMENT_PROFILE.to_owned(),
+            OnePasswordProfileRefs {
+                payment,
+                billing_address: trim_owned_optional(file.billing_address_camel)
+                    .or_else(|| trim_owned_optional(file.billing_address))
+                    .or_else(|| address.clone()),
+                shipping_address: trim_owned_optional(file.shipping_address_camel)
+                    .or_else(|| trim_owned_optional(file.shipping_address))
+                    .or(address),
+            },
+        )],
+    ))
+}
+
+fn onepassword_config_path() -> Result<PathBuf> {
+    let dir = env::var(RUNTIME_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_RUNTIME_DIR));
+    Ok(if dir.is_absolute() {
+        dir.join(ONEPASSWORD_CONFIG_FILE)
+    } else {
+        env::current_dir()?.join(dir).join(ONEPASSWORD_CONFIG_FILE)
+    })
+}
+
+fn env_onepassword_vault() -> Option<String> {
+    env::var(ONEPASSWORD_VAULT_ENV)
+        .ok()
+        .and_then(|vault| trim_owned_optional(Some(vault)))
 }
 
 fn parse_onepassword_items(
@@ -1724,8 +1910,8 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
 mod tests {
     use super::{
         AddressKind, OnePasswordProfileRefs, is_safe_payment_continue, is_sensitive_submit,
-        parse_address_field_ref, parse_field_ref, parse_onepassword_item_json,
-        parse_onepassword_items,
+        parse_address_field_ref, parse_field_ref, parse_onepassword_file_config,
+        parse_onepassword_item_json, parse_onepassword_items,
     };
     #[test]
     fn blocks_final_purchase_actions() {
@@ -1824,6 +2010,68 @@ mod tests {
             None,
             None,
             None,
+        )
+        .unwrap();
+        assert_eq!(
+            items,
+            vec![
+                (
+                    "backup".to_owned(),
+                    OnePasswordProfileRefs {
+                        payment: "Backup Mastercard".to_owned(),
+                        billing_address: None,
+                        shipping_address: None,
+                    }
+                ),
+                (
+                    "default".to_owned(),
+                    OnePasswordProfileRefs {
+                        payment: "Personal Visa".to_owned(),
+                        billing_address: Some("Billing Identity".to_owned()),
+                        shipping_address: Some("Shipping Identity".to_owned()),
+                    }
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_onepassword_setup_file_config() {
+        let (vault, items) = parse_onepassword_file_config(
+            r#"{
+                "vault": "Private",
+                "card": "Personal Visa",
+                "address": "Home Identity"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(vault.as_deref(), Some("Private"));
+        assert_eq!(
+            items,
+            vec![(
+                "default".to_owned(),
+                OnePasswordProfileRefs {
+                    payment: "Personal Visa".to_owned(),
+                    billing_address: Some("Home Identity".to_owned()),
+                    shipping_address: Some("Home Identity".to_owned()),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_onepassword_setup_file_profiles() {
+        let (_vault, items) = parse_onepassword_file_config(
+            r#"{
+                "profiles": {
+                    "backup": "Backup Mastercard",
+                    "default": {
+                        "card": "Personal Visa",
+                        "billingAddress": "Billing Identity",
+                        "shippingAddress": "Shipping Identity"
+                    }
+                }
+            }"#,
         )
         .unwrap();
         assert_eq!(
