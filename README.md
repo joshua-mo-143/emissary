@@ -115,6 +115,38 @@ Prefer the ref flow for dynamic consumer sites:
 2. Use `clickRef` / `typeRef` with those refs instead of guessing CSS selectors.
 3. Fall back to `click`, `type`, or `html` only when refs are insufficient.
 
+For payment forms, use the same ref flow without exposing card values:
+
+```json
+{
+  "actions": [
+    { "op": "observe" },
+    {
+      "op": "fillPaymentRefs",
+      "fields": [
+        { "refId": "e7", "field": "default:card_number" },
+        { "refId": "e8", "field": "default:exp" },
+        { "refId": "e9", "field": "default:cvc" }
+      ]
+    }
+  ]
+}
+```
+
+`field` is a vault credential ID, not a secret value. Supported IDs are `card_number`, `exp`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`, optionally prefixed with a profile such as `default:cvc`.
+
+When the basket/order summary has already been reviewed and the flow reaches card entry, prefer the guarded runtime-owned payment continuation:
+
+```json
+{
+  "actions": [
+    { "op": "autoFillPaymentAndContinue", "profile": "default" }
+  ]
+}
+```
+
+This fills detected payment fields from the vault and clicks only a clearly non-final continue/next/checkout control. Final submit controls such as `Pay now`, `Place order`, or `Complete purchase` still trigger human handoff.
+
 One-shot headless run (separate from chat, for testing):
 
 ```sh

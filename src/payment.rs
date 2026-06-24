@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::Tab;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, env, process::Command};
 
@@ -87,6 +88,18 @@ const NAVIGATE_PATTERNS: &[&str] = &[
     "view checkout",
 ];
 
+const SAFE_PAYMENT_CONTINUE_PATTERNS: &[&str] = &[
+    "continue",
+    "next",
+    "checkout",
+    "review order",
+    "review your order",
+    "confirm details",
+    "use this card",
+    "save card",
+    "save and continue",
+];
+
 pub struct SecretString(String);
 
 impl SecretString {
@@ -152,6 +165,24 @@ struct AddressProfile {
 #[derive(Default)]
 pub struct PaymentVault {
     profiles: HashMap<String, PaymentProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct PaymentFieldMapping {
+    /// Input/select element ref returned by observe/current page elements.
+    #[serde(rename = "refId")]
+    pub ref_id: String,
+    /// Vault credential ID, e.g. default:card_number, default:exp, default:cvc, default:name, or default:postal_code.
+    pub field: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaymentContinueCandidate {
+    #[serde(rename = "refId")]
+    ref_id: String,
+    label: String,
+    details: String,
+    tag: String,
 }
 
 impl PaymentVault {
@@ -251,6 +282,32 @@ impl PaymentVault {
         Ok(json!({
             "filled_payment": profile_key,
             "fields": filled,
+        }))
+    }
+
+    pub fn fill_payment_refs(
+        tab: &Tab,
+        vault: &PaymentVault,
+        mappings: &[PaymentFieldMapping],
+    ) -> Result<Value> {
+        if mappings.is_empty() {
+            bail!("fillPaymentRefs requires at least one field mapping");
+        }
+
+        let mut filled = Vec::new();
+        for mapping in mappings {
+            let (profile_key, field_name) = parse_field_ref(&mapping.field)?;
+            let value = vault.secret(profile_key, field_name)?;
+            let details = inject_into_ref(tab, &mapping.ref_id, value.expose())?;
+            filled.push(json!({
+                "refId": mapping.ref_id.as_str(),
+                "field": format!("{profile_key}:{field_name}"),
+                "tag": details.get("tag").cloned().unwrap_or(Value::Null),
+            }));
+        }
+
+        Ok(json!({
+            "filled_payment_refs": filled,
         }))
     }
 
@@ -389,6 +446,32 @@ impl PaymentVault {
         Ok(json!({
             "filled": format!("{profile_key}:{}.{}", kind.as_str(), field_name),
             "into": css,
+    pub fn fill_payment_and_continue(
+        tab: &Tab,
+        vault: &PaymentVault,
+        profile_key: &str,
+    ) -> Result<Value> {
+        let filled = Self::fill_payment(tab, vault, profile_key)?;
+        let candidates = payment_continue_candidates(tab)?;
+        let selected = candidates
+            .iter()
+            .find(|candidate| {
+                is_safe_payment_continue(&candidate.label)
+                    && !is_sensitive_submit(&candidate.details)
+            })
+            .ok_or_else(|| continue_selection_error(&candidates))?;
+
+        let clicked = click_payment_continue_ref(tab, &selected.ref_id)?;
+        thread::sleep(Duration::from_millis(750));
+
+        Ok(json!({
+            "filled_payment": filled.get("filled_payment").cloned().unwrap_or_else(|| json!(profile_key)),
+            "fields": filled.get("fields").cloned().unwrap_or_else(|| json!([])),
+            "continued": {
+                "label": selected.label,
+                "tag": selected.tag,
+                "clicked": clicked.get("clicked").cloned().unwrap_or_else(|| json!(true)),
+            }
         }))
     }
 }
@@ -486,8 +569,152 @@ pub fn is_sensitive_submit(details: &str) -> bool {
 pub fn block_type_on_credential_field(tab: &Tab, css: &str) -> Result<()> {
     if element_is_credential_field(tab, css)? {
         bail!("credential fields must use fill_payment/fill_address vault actions");
+          }
+    Ok(())
+}
+pub fn is_safe_payment_continue(details: &str) -> bool {
+    if is_sensitive_submit(details) {
+        return false;
+    }
+
+    let lower = details.to_lowercase();
+    SAFE_PAYMENT_CONTINUE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+pub fn block_type_on_payment_field(tab: &Tab, css: &str) -> Result<()> {
+    if element_is_payment_field(tab, css)? {
+        bail!("payment field must use fill_payment or fill_payment_field");
     }
     Ok(())
+}
+
+fn continue_selection_error(candidates: &[PaymentContinueCandidate]) -> anyhow::Error {
+    let final_labels = candidates
+        .iter()
+        .filter(|candidate| {
+            is_sensitive_submit(&candidate.label) || is_sensitive_submit(&candidate.details)
+        })
+        .map(|candidate| candidate.label.trim())
+        .filter(|label| !label.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+
+    if final_labels.is_empty() {
+        anyhow!("payment filled, but no safe continue/next/checkout control was visible")
+    } else {
+        anyhow!(
+            "payment filled, but only final submit controls were visible: {}",
+            final_labels.join(", ")
+        )
+    }
+}
+
+fn payment_continue_candidates(tab: &Tab) -> Result<Vec<PaymentContinueCandidate>> {
+    let js = r##"(() => {
+        function visible(el) {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom >= 0 &&
+                rect.right >= 0 &&
+                rect.top <= innerHeight &&
+                rect.left <= innerWidth &&
+                style.visibility !== "hidden" &&
+                style.display !== "none" &&
+                style.opacity !== "0" &&
+                !el.disabled &&
+                el.getAttribute("aria-disabled") !== "true";
+        }
+
+        function clean(text) {
+            return String(text || "").replace(/\s+/g, " ").trim();
+        }
+
+        function labelFor(el) {
+            const bits = [
+                el.innerText,
+                el.textContent,
+                el.getAttribute("aria-label"),
+                el.getAttribute("title"),
+                el.getAttribute("value"),
+                el.getAttribute("name"),
+                el.id
+            ].map(clean).filter(Boolean);
+            return bits[0] || "";
+        }
+
+        const candidates = [];
+        let nextRef = 1;
+        for (const el of document.querySelectorAll("button, a[href], input[type='button'], input[type='submit'], [role='button']")) {
+            if (!visible(el)) continue;
+            const label = labelFor(el);
+            if (!label) continue;
+            const refId = `pc${nextRef++}`;
+            el.setAttribute("data-emissary-payment-continue-ref", refId);
+            const form = el.closest("form");
+            const details = [
+                label,
+                el.getAttribute("aria-label"),
+                el.getAttribute("title"),
+                el.getAttribute("value"),
+                el.getAttribute("name"),
+                el.id,
+                form && form.innerText
+            ].map(clean).filter(Boolean).join("\n").slice(0, 2000);
+            candidates.push({
+                refId,
+                label,
+                details,
+                tag: el.tagName.toLowerCase()
+            });
+        }
+        return JSON.stringify(candidates);
+    })()"##;
+    let raw = tab.evaluate(js, true)?.value.unwrap_or(Value::Null);
+    Ok(serde_json::from_str(&value_to_string(raw))?)
+}
+
+fn click_payment_continue_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
+    let ref_json = serde_json::to_string(ref_id)?;
+    let js = format!(
+        r##"(() => {{
+            const refId = {ref_json};
+            const el = document.querySelector(`[data-emissary-payment-continue-ref="${{refId}}"]`);
+            if (!el) {{
+                return JSON.stringify({{
+                    clicked: false,
+                    reason: "safe payment continue control disappeared"
+                }});
+            }}
+            el.scrollIntoView({{ block: "center", inline: "center" }});
+            el.click();
+            return JSON.stringify({{
+                clicked: true,
+                label: (el.innerText || el.textContent || el.getAttribute("value") || "").trim(),
+                tag: el.tagName.toLowerCase()
+            }});
+        }})()"##
+    );
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    let details: Value = serde_json::from_str(&value_to_string(raw))?;
+    if details
+        .get("clicked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(details)
+    } else {
+        bail!(
+            "{}",
+            details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("auto payment continue failed")
+        )
+    }
 }
 
 fn parse_field_ref(field_ref: &str) -> Result<(&str, &str)> {
@@ -1393,6 +1620,86 @@ fn inject_into_selector(tab: &Tab, css: &str, value: &str) -> Result<()> {
 }
 
 fn element_is_credential_field(tab: &Tab, css: &str) -> Result<bool> {
+fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
+    let ref_json = serde_json::to_string(ref_id)?;
+    let value_json = serde_json::to_string(value)?;
+    let js = format!(
+        r##"(() => {{
+            const refId = {ref_json};
+            const value = {value_json};
+            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
+                .find((candidate) => candidate.dataset.emissaryRef === refId);
+            if (!el) {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "unknown element ref; call observe again"
+                }});
+            }}
+            if (el.disabled || el.readOnly) {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "element is disabled or read-only"
+                }});
+            }}
+
+            el.scrollIntoView({{ block: "center", inline: "center" }});
+            el.focus();
+            if (el.tagName.toLowerCase() === "select") {{
+                const exact = Array.from(el.options).find((option) => option.value === value);
+                const byText = Array.from(el.options).find((option) =>
+                    option.textContent.trim().toLowerCase() === value.toLowerCase()
+                );
+                const option = exact || byText;
+                if (!option) {{
+                    return JSON.stringify({{
+                        filled: false,
+                        refId,
+                        reason: "no matching select option"
+                    }});
+                }}
+                el.value = option.value;
+            }} else if ("value" in el) {{
+                el.value = value;
+            }} else if (el.isContentEditable) {{
+                el.textContent = value;
+            }} else {{
+                return JSON.stringify({{
+                    filled: false,
+                    refId,
+                    reason: "element cannot receive text"
+                }});
+            }}
+            el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            return JSON.stringify({{
+                filled: true,
+                refId,
+                tag: el.tagName.toLowerCase()
+            }});
+        }})()"##
+    );
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    let details: Value = serde_json::from_str(&value_to_string(raw))?;
+    if details
+        .get("filled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(details)
+    } else {
+        bail!(
+            "{}",
+            details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("fillPaymentRefs failed")
+        )
+    }
+}
+
+fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
     let css_json = serde_json::to_string(css)?;
     let js = format!(
         r#"(() => {{
@@ -1422,6 +1729,10 @@ mod tests {
         AddressKind, OnePasswordProfileRefs, is_sensitive_submit, parse_address_field_ref,
         parse_field_ref, parse_onepassword_item_json, parse_onepassword_items,
     };
+        PaymentFieldMapping, PaymentVault, is_safe_payment_continue, is_sensitive_submit,
+        parse_field_ref,
+    };
+    use std::fs;
 
     #[test]
     fn blocks_final_purchase_actions() {
@@ -1436,6 +1747,16 @@ mod tests {
         assert!(!is_sensitive_submit("Proceed to payment"));
         assert!(!is_sensitive_submit("Go to checkout"));
         assert!(!is_sensitive_submit("Checkout"));
+    }
+
+    #[test]
+    fn classifies_safe_payment_continue_controls() {
+        assert!(is_safe_payment_continue("Continue"));
+        assert!(is_safe_payment_continue("Next"));
+        assert!(is_safe_payment_continue("Checkout"));
+        assert!(is_safe_payment_continue("Continue to review order"));
+        assert!(!is_safe_payment_continue("Pay now"));
+        assert!(!is_safe_payment_continue("Complete purchase"));
     }
 
     #[test]
