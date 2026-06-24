@@ -1,3 +1,4 @@
+use crate::browser_dom::FRAME_HELPERS;
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::Tab;
 use schemars::JsonSchema;
@@ -303,6 +304,7 @@ impl PaymentVault {
                 "refId": mapping.ref_id.as_str(),
                 "field": format!("{profile_key}:{field_name}"),
                 "tag": details.get("tag").cloned().unwrap_or(Value::Null),
+                "frame": details.get("frame").cloned().unwrap_or(Value::Null),
             }));
         }
 
@@ -608,27 +610,9 @@ fn continue_selection_error(candidates: &[PaymentContinueCandidate]) -> anyhow::
 }
 
 fn payment_continue_candidates(tab: &Tab) -> Result<Vec<PaymentContinueCandidate>> {
-    let js = r##"(() => {
-        function visible(el) {
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 &&
-                rect.height > 0 &&
-                rect.bottom >= 0 &&
-                rect.right >= 0 &&
-                rect.top <= innerHeight &&
-                rect.left <= innerWidth &&
-                style.visibility !== "hidden" &&
-                style.display !== "none" &&
-                style.opacity !== "0" &&
-                !el.disabled &&
-                el.getAttribute("aria-disabled") !== "true";
-        }
-
-        function clean(text) {
-            return String(text || "").replace(/\s+/g, " ").trim();
-        }
-
+    let js = [
+        FRAME_HELPERS,
+        r##"(() => {
         function labelFor(el) {
             const bits = [
                 el.innerText,
@@ -638,57 +622,65 @@ fn payment_continue_candidates(tab: &Tab) -> Result<Vec<PaymentContinueCandidate
                 el.getAttribute("value"),
                 el.getAttribute("name"),
                 el.id
-            ].map(clean).filter(Boolean);
+            ].map(emissaryClean).filter(Boolean);
             return bits[0] || "";
         }
 
         const candidates = [];
         let nextRef = 1;
-        for (const el of document.querySelectorAll("button, a[href], input[type='button'], input[type='submit'], [role='button']")) {
-            if (!visible(el)) continue;
-            const label = labelFor(el);
-            if (!label) continue;
-            const refId = `pc${nextRef++}`;
-            el.setAttribute("data-emissary-payment-continue-ref", refId);
-            const form = el.closest("form");
-            const details = [
-                label,
-                el.getAttribute("aria-label"),
-                el.getAttribute("title"),
-                el.getAttribute("value"),
-                el.getAttribute("name"),
-                el.id,
-                form && form.innerText
-            ].map(clean).filter(Boolean).join("\n").slice(0, 2000);
-            candidates.push({
-                refId,
-                label,
-                details,
-                tag: el.tagName.toLowerCase()
-            });
+        for (const ctx of emissaryFrameDocuments()) {
+            if (ctx.frameElement && !emissaryVisible(ctx.frameElement)) continue;
+            for (const el of ctx.doc.querySelectorAll("button, a[href], input[type='button'], input[type='submit'], [role='button']")) {
+                if (!emissaryVisible(el) || el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+                const label = labelFor(el);
+                if (!label) continue;
+                const refId = `pc${nextRef++}`;
+                el.setAttribute("data-emissary-payment-continue-ref", refId);
+                const form = el.closest("form");
+                const details = [
+                    label,
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("title"),
+                    el.getAttribute("value"),
+                    el.getAttribute("name"),
+                    el.id,
+                    form && form.innerText
+                ].map(emissaryClean).filter(Boolean).join("\n").slice(0, 2000);
+                candidates.push({
+                    refId,
+                    label,
+                    details,
+                    tag: el.tagName.toLowerCase()
+                });
+            }
         }
         return JSON.stringify(candidates);
-    })()"##;
-    let raw = tab.evaluate(js, true)?.value.unwrap_or(Value::Null);
+    })()"##,
+    ]
+    .join("\n");
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
     Ok(serde_json::from_str(&value_to_string(raw))?)
 }
 
 fn click_payment_continue_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
-            const el = document.querySelector(`[data-emissary-payment-continue-ref="${{refId}}"]`);
-            if (!el) {{
+            const match = emissaryFindByAttribute(refId, "data-emissary-payment-continue-ref");
+            if (!match) {{
                 return JSON.stringify({{
                     clicked: false,
                     reason: "safe payment continue control disappeared"
                 }});
             }}
-            el.scrollIntoView({{ block: "center", inline: "center" }});
+            const el = match.el;
+            emissaryScrollIntoView(match, el);
             el.click();
             return JSON.stringify({{
                 clicked: true,
+                frame: emissaryFrameName(match.path),
                 label: (el.innerText || el.textContent || el.getAttribute("value") || "").trim(),
                 tag: el.tagName.toLowerCase()
             }});
@@ -1651,18 +1643,19 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
     let ref_json = serde_json::to_string(ref_id)?;
     let value_json = serde_json::to_string(value)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
             const value = {value_json};
-            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
-                .find((candidate) => candidate.dataset.emissaryRef === refId);
-            if (!el) {{
+            const match = emissaryFindRef(refId);
+            if (!match) {{
                 return JSON.stringify({{
                     filled: false,
                     refId,
                     reason: "unknown element ref; call observe again"
                 }});
             }}
+            const el = match.el;
             if (el.disabled || el.readOnly) {{
                 return JSON.stringify({{
                     filled: false,
@@ -1671,7 +1664,7 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
                 }});
             }}
 
-            el.scrollIntoView({{ block: "center", inline: "center" }});
+            emissaryScrollIntoView(match, el);
             el.focus();
             if (el.tagName.toLowerCase() === "select") {{
                 const exact = Array.from(el.options).find((option) => option.value === value);
@@ -1703,6 +1696,7 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
             return JSON.stringify({{
                 filled: true,
                 refId,
+                frame: emissaryFrameName(match.path),
                 tag: el.tagName.toLowerCase()
             }});
         }})()"##

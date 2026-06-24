@@ -111,7 +111,7 @@ Schema: `cargo run -- schema`
 
 Prefer the ref flow for dynamic consumer sites:
 
-1. `observe` returns visible page text plus `elements` like `{ "ref": "e1", "kind": "button", "label": "Search" }`.
+1. `observe` returns visible page text plus `elements` like `{ "ref": "e1", "kind": "button", "label": "Search" }`; accessible iframe controls include a `frame` label but use the same ref actions.
 2. Use `clickRef` / `typeRef` with those refs instead of guessing CSS selectors.
 3. Fall back to `click`, `type`, or `html` only when refs are insufficient.
 
