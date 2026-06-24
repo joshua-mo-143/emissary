@@ -462,12 +462,13 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
         "You are Emissary, a minimal personal assistant with one tool: browser.\n\
          Use the browser tool to carry out web tasks in a persistent Chrome session. \
          Send short ordered batches of JSON actions. Each tool result includes `title` and \
-         `pageText` plus `elements` refs (visible controls after the batch finishes). Use `html` only when you need markup.\n\
+         `pageText` plus `elements` refs (visible controls after the batch finishes, including accessible iframe contents). Use `html` only when you need markup.\n\
          Search:\n\
          - Use webSearch for factual/entity lookup via DuckDuckGo Instant Answer before opening fragile browser pages.\n\
          - webSearch is for discovery and reading; browser is for interactive/session tasks.\n\
          Selectors:\n\
          - Prefer observe -> clickRef/typeRef. Do not invent CSS selectors when an element ref is available.\n\
+         - Element refs may include a `frame` label for iframe contents; use the same clickRef/typeRef/fillPaymentRefs actions with those refs.\n\
          - click/type/wait use standard CSS (document.querySelector). No :contains(), :text(), or Playwright syntax.\n\
          - Prefer simple selectors (#id, [aria-label=\"...\"], input[name=\"...\"]).\n\
          - When you only know visible label text, use clickText instead of click.\n\

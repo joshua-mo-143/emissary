@@ -1,4 +1,5 @@
 mod actions;
+mod browser_dom;
 mod daemon;
 mod harness;
 mod image_display;

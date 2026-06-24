@@ -1,3 +1,4 @@
+use crate::browser_dom::FRAME_HELPERS;
 use crate::payment::{
     PaymentFieldMapping, PaymentVault, block_type_on_credential_field, is_sensitive_submit,
 };
@@ -152,6 +153,8 @@ pub struct ElementRef {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,7 +212,7 @@ pub fn tool_schema() -> Value {
                 "completed": 3,
                 "title": "Uber Eats",
                 "pageText": "Visible page text snapshot (truncated)…",
-                "elements": [{ "ref": "e1", "kind": "button", "label": "Search" }],
+                "elements": [{ "ref": "e1", "kind": "button", "label": "Search", "frame": "iframe:1" }],
                 "results": [{ "index": 0, "op": "screenshot", "ok": { "screenshot_scope": "page_viewport", "screenshot_base64": "..." } }]
             },
             "needs_human": {
@@ -540,7 +543,8 @@ fn enrich_selector_error(selector: &str, error: anyhow::Error) -> anyhow::Error 
 fn click_by_visible_text(tab: &Tab, text: &str) -> Result<Value> {
     let needle = serde_json::to_string(text)?;
     let js = format!(
-        r#"(() => {{
+        r#"{FRAME_HELPERS}
+        (() => {{
             const needle = {needle}.trim().toLowerCase();
             if (!needle) return {{ clicked: false, reason: "empty text" }};
             const selectors = [
@@ -554,9 +558,11 @@ fn click_by_visible_text(tab: &Tab, text: &str) -> Result<Value> {
                 "label",
             ];
             const seen = new Set();
-            for (const sel of selectors) {{
-                for (const el of document.querySelectorAll(sel)) {{
-                    if (seen.has(el)) continue;
+            for (const ctx of emissaryFrameDocuments()) {{
+                if (ctx.frameElement && !emissaryVisible(ctx.frameElement)) continue;
+                for (const sel of selectors) {{
+                    for (const el of ctx.doc.querySelectorAll(sel)) {{
+                    if (seen.has(el) || !emissaryVisible(el)) continue;
                     seen.add(el);
                     const hay = [
                         el.innerText,
@@ -569,14 +575,16 @@ fn click_by_visible_text(tab: &Tab, text: &str) -> Result<Value> {
                         .join(" ")
                         .toLowerCase();
                     if (!hay.includes(needle)) continue;
-                    el.scrollIntoView({{ block: "center", inline: "center" }});
+                    emissaryScrollIntoView(ctx, el);
                     el.click();
                     return JSON.stringify({{
                         clicked: true,
                         text: {needle},
                         tag: el.tagName,
+                        frame: emissaryFrameName(ctx.path),
                         label: (el.innerText || el.getAttribute("aria-label") || "").trim().slice(0, 200),
                     }});
+                    }}
                 }}
             }}
             return JSON.stringify({{ clicked: false, text: {needle}, reason: "no matching clickable element" }});
@@ -612,9 +620,8 @@ fn selector_value(tab: &Tab, selector: &str, property: &str) -> Result<Value> {
 fn current_page_snapshot(tab: &Tab) -> PageSnapshot {
     PageSnapshot {
         title: tab.get_title().unwrap_or_default(),
-        page_text: selector_value(tab, "body", "innerText")
+        page_text: page_text_snapshot(tab)
             .ok()
-            .map(value_to_string)
             .map(truncate_page_text)
             .unwrap_or_default(),
         elements: observe_elements(tab).unwrap_or_default(),
@@ -622,8 +629,30 @@ fn current_page_snapshot(tab: &Tab) -> PageSnapshot {
     }
 }
 
+fn page_text_snapshot(tab: &Tab) -> Result<String> {
+    let js = [
+        FRAME_HELPERS,
+        r##"(() => {
+            const parts = [];
+            for (const ctx of emissaryFrameDocuments()) {
+                const text = emissaryClean(ctx.doc.body && ctx.doc.body.innerText);
+                if (!text) continue;
+                const frame = emissaryFrameName(ctx.path);
+                parts.push(frame ? `[${frame}]\n${text}` : text);
+            }
+            return parts.join("\n\n");
+        })()"##,
+    ]
+    .join("\n");
+    Ok(value_to_string(
+        tab.evaluate(&js, false)?.value.unwrap_or(Value::Null),
+    ))
+}
+
 fn observe_elements(tab: &Tab) -> Result<Vec<ElementRef>> {
-    let js = r##"(() => {
+    let js = [
+        FRAME_HELPERS,
+        r##"(() => {
         let nextId = Number(document.documentElement.dataset.emissaryNextRef || "1");
         const selector = [
             "button",
@@ -637,20 +666,6 @@ fn observe_elements(tab: &Tab) -> Result<Vec<ElementRef>> {
             "[onclick]",
             "label"
         ].join(",");
-
-        function visible(el) {
-            const rect = el.getBoundingClientRect();
-            const style = getComputedStyle(el);
-            return rect.width > 1 &&
-                rect.height > 1 &&
-                rect.bottom >= 0 &&
-                rect.right >= 0 &&
-                rect.top <= innerHeight &&
-                rect.left <= innerWidth &&
-                style.visibility !== "hidden" &&
-                style.display !== "none" &&
-                style.opacity !== "0";
-        }
 
         function textFor(el) {
             return [
@@ -676,39 +691,47 @@ fn observe_elements(tab: &Tab) -> Result<Vec<ElementRef>> {
 
         const out = [];
         const seen = new Set();
-        for (const el of document.querySelectorAll(selector)) {
-            if (seen.has(el) || !visible(el)) continue;
-            seen.add(el);
-            const label = textFor(el);
-            const kind = kindFor(el);
-            if (!label && kind !== "input" && kind !== "select") continue;
-            if (!el.dataset.emissaryRef) {
-                el.dataset.emissaryRef = `e${nextId++}`;
+        for (const ctx of emissaryFrameDocuments()) {
+            if (ctx.frameElement && !emissaryVisible(ctx.frameElement)) continue;
+            for (const el of ctx.doc.querySelectorAll(selector)) {
+                if (seen.has(el) || !emissaryVisible(el)) continue;
+                seen.add(el);
+                const label = textFor(el);
+                const kind = kindFor(el);
+                if (!label && kind !== "input" && kind !== "select") continue;
+                if (!el.getAttribute("data-emissary-ref")) {
+                    el.setAttribute("data-emissary-ref", `e${nextId++}`);
+                }
+                out.push({
+                    ref: el.getAttribute("data-emissary-ref"),
+                    kind,
+                    label: (label || `${el.tagName.toLowerCase()} ${el.name || el.id || ""}`).slice(0, 180),
+                    tag: el.tagName.toLowerCase(),
+                    frame: emissaryFrameName(ctx.path)
+                });
+                if (out.length >= 80) break;
             }
-            out.push({
-                ref: el.dataset.emissaryRef,
-                kind,
-                label: (label || `${el.tagName.toLowerCase()} ${el.name || el.id || ""}`).slice(0, 180),
-                tag: el.tagName.toLowerCase()
-            });
             if (out.length >= 80) break;
         }
         document.documentElement.dataset.emissaryNextRef = String(nextId);
         return JSON.stringify(out);
-    })()"##;
+    })()"##,
+    ]
+    .join("\n");
 
-    let value = tab.evaluate(js, true)?.value.unwrap_or(Value::Null);
+    let value = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
     Ok(serde_json::from_str(&value_to_string(value)).unwrap_or_default())
 }
 
 fn element_ref_details(tab: &Tab, ref_id: &str) -> Result<String> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
-                .find((candidate) => candidate.dataset.emissaryRef === refId);
-            if (!el) return "";
+            const match = emissaryFindRef(refId);
+            if (!match) return "";
+            const el = match.el;
             const form = el.closest("form");
             return [
                 el.innerText,
@@ -734,16 +757,18 @@ fn element_ref_details(tab: &Tab, ref_id: &str) -> Result<String> {
 fn click_by_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
-                .find((candidate) => candidate.dataset.emissaryRef === refId);
-            if (!el) return JSON.stringify({{ clicked: false, ref: refId, reason: "unknown element ref; call observe again" }});
-            el.scrollIntoView({{ block: "center", inline: "center" }});
+            const match = emissaryFindRef(refId);
+            if (!match) return JSON.stringify({{ clicked: false, ref: refId, reason: "unknown element ref; call observe again" }});
+            const el = match.el;
+            emissaryScrollIntoView(match, el);
             el.click();
             return JSON.stringify({{
                 clicked: true,
                 ref: refId,
+                frame: emissaryFrameName(match.path),
                 label: (el.innerText || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "").trim().slice(0, 200),
                 tag: el.tagName.toLowerCase()
             }});
@@ -773,13 +798,14 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
     let ref_json = serde_json::to_string(ref_id)?;
     let text_json = serde_json::to_string(text)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
             const text = {text_json};
-            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
-                .find((candidate) => candidate.dataset.emissaryRef === refId);
-            if (!el) return JSON.stringify({{ typed: false, ref: refId, reason: "unknown element ref; call observe again" }});
-            el.scrollIntoView({{ block: "center", inline: "center" }});
+            const match = emissaryFindRef(refId);
+            if (!match) return JSON.stringify({{ typed: false, ref: refId, reason: "unknown element ref; call observe again" }});
+            const el = match.el;
+            emissaryScrollIntoView(match, el);
             el.focus();
             if ("value" in el) {{
                 el.value = text;
@@ -789,7 +815,7 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
                 el.textContent = text;
                 el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: text }}));
             }}
-            return JSON.stringify({{ typed: true, ref: refId, tag: el.tagName.toLowerCase() }});
+            return JSON.stringify({{ typed: true, ref: refId, frame: emissaryFrameName(match.path), tag: el.tagName.toLowerCase() }});
         }})()"##
     );
     let value = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
@@ -810,11 +836,12 @@ fn type_by_ref(tab: &Tab, ref_id: &str, text: &str) -> Result<Value> {
 fn element_ref_is_credential_field(tab: &Tab, ref_id: &str) -> Result<bool> {
     let ref_json = serde_json::to_string(ref_id)?;
     let js = format!(
-        r##"(() => {{
+        r##"{FRAME_HELPERS}
+        (() => {{
             const refId = {ref_json};
-            const el = Array.from(document.querySelectorAll("[data-emissary-ref]"))
-                .find((candidate) => candidate.dataset.emissaryRef === refId);
-            if (!el) return false;
+            const match = emissaryFindRef(refId);
+            if (!match) return false;
+            const el = match.el;
             const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
             if (/^(cc-|shipping |billing )/.test(autocomplete)) return true;
             const hay = [
