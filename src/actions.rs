@@ -1,6 +1,5 @@
-use crate::payment::{PaymentVault, block_type_on_credential_field, is_sensitive_submit};
 use crate::payment::{
-    PaymentFieldMapping, PaymentVault, block_type_on_payment_field, is_sensitive_submit,
+    PaymentFieldMapping, PaymentVault, block_type_on_credential_field, is_sensitive_submit,
 };
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use crate::search::duckduckgo_instant_answer;
@@ -15,22 +14,33 @@ use std::{sync::Arc, thread, time::Duration};
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Action {
     /// Search DuckDuckGo Instant Answer for facts and entities without using the browser.
-    WebSearch { query: String },
+    WebSearch {
+        query: String,
+    },
     /// Navigate the browser to a URL.
-    Navigate { url: String },
+    Navigate {
+        url: String,
+    },
     /// Return visible page text and stable refs for clickable/input elements.
     Observe,
     /// Click a visible element by CSS selector, or XPath when the selector starts with //.
-    Click { selector: String },
+    Click {
+        selector: String,
+    },
     /// Click an element ref returned by observe/current page elements.
     ClickRef {
         #[serde(rename = "refId")]
         ref_id: String,
     },
     /// Click a button or link by visible label text.
-    ClickText { text: String },
+    ClickText {
+        text: String,
+    },
     /// Type text into a selector. Do not use for payment fields.
-    Type { selector: String, text: String },
+    Type {
+        selector: String,
+        text: String,
+    },
     /// Type text into an observed element ref. Do not use for payment fields.
     TypeRef {
         #[serde(rename = "refId")]
@@ -38,9 +48,13 @@ pub enum Action {
         text: String,
     },
     /// Press a keyboard key such as Enter or Tab.
-    Press { key: String },
+    Press {
+        key: String,
+    },
     /// Wait for a CSS selector or XPath to become visible.
-    Wait { selector: String },
+    Wait {
+        selector: String,
+    },
     /// Return the current page title.
     Title,
     /// Return innerText for a selector, defaulting to body.
@@ -54,13 +68,26 @@ pub enum Action {
         selector: String,
     },
     /// Evaluate JavaScript in the page.
-    Eval { expression: String },
+    Eval {
+        expression: String,
+    },
     /// Legacy automatic payment form fill by profile key. Prefer observe -> fillPaymentRefs.
-    FillPayment { profile: String },
+    FillPayment {
+        profile: String,
+    },
     /// Fill payment fields by observed element refs and vault credential IDs.
     FillPaymentRefs {
         #[schemars(length(min = 1))]
         fields: Vec<PaymentFieldMapping>,
+    },
+    /// Fill one payment field by selector and vault credential ID.
+    FillPaymentField {
+        selector: String,
+        field: String,
+    },
+    /// Fill detected payment fields and guardedly continue to the next checkout step.
+    AutoFillPaymentAndContinue {
+        profile: String,
     },
     FillAddress {
         profile: String,
@@ -368,7 +395,7 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         }
         Action::FillAddressField { selector, field } => {
             PaymentVault::fill_address_field(tab, context.payment, selector, field)
-      }
+        }
         Action::AutoFillPaymentAndContinue { profile } => {
             let result = PaymentVault::fill_payment_and_continue(tab, context.payment, profile)
                 .map_err(|_| review::handoff_required(HandoffReason::manual()))?;
@@ -466,6 +493,7 @@ fn action_detail(action: &Action) -> String {
         }
         Action::FillAddressField { selector, field } => {
             format!("fillAddressField selector={selector:?} field={field}")
+        }
         Action::AutoFillPaymentAndContinue { profile } => {
             format!("autoFillPaymentAndContinue profile={profile}")
         }

@@ -3,7 +3,7 @@ use headless_chrome::Tab;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, process::Command};
+use std::{collections::HashMap, env, process::Command, thread, time::Duration};
 
 const ONEPASSWORD_ITEM_ENV: &str = "PAYMENT_1PASSWORD_ITEM";
 const ONEPASSWORD_ITEMS_ENV: &str = "PAYMENT_1PASSWORD_ITEMS";
@@ -446,6 +446,9 @@ impl PaymentVault {
         Ok(json!({
             "filled": format!("{profile_key}:{}.{}", kind.as_str(), field_name),
             "into": css,
+        }))
+    }
+
     pub fn fill_payment_and_continue(
         tab: &Tab,
         vault: &PaymentVault,
@@ -569,7 +572,7 @@ pub fn is_sensitive_submit(details: &str) -> bool {
 pub fn block_type_on_credential_field(tab: &Tab, css: &str) -> Result<()> {
     if element_is_credential_field(tab, css)? {
         bail!("credential fields must use fill_payment/fill_address vault actions");
-          }
+    }
     Ok(())
 }
 pub fn is_safe_payment_continue(details: &str) -> bool {
@@ -581,13 +584,6 @@ pub fn is_safe_payment_continue(details: &str) -> bool {
     SAFE_PAYMENT_CONTINUE_PATTERNS
         .iter()
         .any(|pattern| lower.contains(pattern))
-}
-
-pub fn block_type_on_payment_field(tab: &Tab, css: &str) -> Result<()> {
-    if element_is_payment_field(tab, css)? {
-        bail!("payment field must use fill_payment or fill_payment_field");
-    }
-    Ok(())
 }
 
 fn continue_selection_error(candidates: &[PaymentContinueCandidate]) -> anyhow::Error {
@@ -714,6 +710,14 @@ fn click_payment_continue_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or("auto payment continue failed")
         )
+    }
+}
+
+fn value_to_string(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -1620,6 +1624,29 @@ fn inject_into_selector(tab: &Tab, css: &str, value: &str) -> Result<()> {
 }
 
 fn element_is_credential_field(tab: &Tab, css: &str) -> Result<bool> {
+    let css_json = serde_json::to_string(css)?;
+    let js = format!(
+        r#"(() => {{
+            const el = document.querySelector({css_json});
+            if (!el) return false;
+            const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
+            if (/^(cc-|shipping |billing )/.test(autocomplete)) return true;
+            const haystack = [
+                el.getAttribute("name"),
+                el.getAttribute("id"),
+                el.getAttribute("placeholder"),
+                el.getAttribute("aria-label")
+            ].filter(Boolean).join(" ").toLowerCase();
+            return /card|cvc|cvv|exp|security code|postal|postcode|zip|address|street|city|state|province|country|phone|email/.test(haystack);
+        }})()"#
+    );
+    Ok(tab
+        .evaluate(&js, false)?
+        .value
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
 fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
     let ref_json = serde_json::to_string(ref_id)?;
     let value_json = serde_json::to_string(value)?;
@@ -1699,41 +1726,13 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
     }
 }
 
-fn element_is_payment_field(tab: &Tab, css: &str) -> Result<bool> {
-    let css_json = serde_json::to_string(css)?;
-    let js = format!(
-        r#"(() => {{
-            const el = document.querySelector({css_json});
-            if (!el) return false;
-            const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
-            if (/^(cc-|shipping |billing )/.test(autocomplete)) return true;
-            const haystack = [
-                el.getAttribute("name"),
-                el.getAttribute("id"),
-                el.getAttribute("placeholder"),
-                el.getAttribute("aria-label")
-            ].filter(Boolean).join(" ").toLowerCase();
-            return /card|cvc|cvv|exp|security code|postal|postcode|zip|address|street|city|state|province|country|phone|email/.test(haystack);
-        }})()"#
-    );
-    Ok(tab
-        .evaluate(&js, false)?
-        .value
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressKind, OnePasswordProfileRefs, is_sensitive_submit, parse_address_field_ref,
-        parse_field_ref, parse_onepassword_item_json, parse_onepassword_items,
+        AddressKind, OnePasswordProfileRefs, is_safe_payment_continue, is_sensitive_submit,
+        parse_address_field_ref, parse_field_ref, parse_onepassword_item_json,
+        parse_onepassword_items,
     };
-        PaymentFieldMapping, PaymentVault, is_safe_payment_continue, is_sensitive_submit,
-        parse_field_ref,
-    };
-    use std::fs;
-
     #[test]
     fn blocks_final_purchase_actions() {
         assert!(is_sensitive_submit("Place order"));
