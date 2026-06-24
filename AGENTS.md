@@ -36,8 +36,8 @@ Runtime data (gitignored):
 | `VENICE_BASE_URL` | no | `https://api.venice.ai/api/v1` |
 | `VENICE_MODEL` | no | `deepseek-v4-flash` |
 | `CHROME` | no | auto-detect Chromium |
-| `PAYMENT_1PASSWORD_ITEM` | unless using `PAYMENT_1PASSWORD_ITEMS` | — |
-| `PAYMENT_1PASSWORD_ITEMS` | for multiple 1Password profiles | — |
+| `PAYMENT_1PASSWORD_ITEM` | no; only for checkout payment automation | — |
+| `PAYMENT_1PASSWORD_ITEMS` | no; only for multiple checkout payment profiles | — |
 | `PAYMENT_1PASSWORD_ADDRESS_ITEM` | no | — |
 | `PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM` | no | — |
 | `PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM` | no | — |
