@@ -7,7 +7,6 @@ mod harness;
 mod image_display;
 mod payment;
 mod review;
-mod search;
 
 use actions::{RunContext, outcome_to_json, run_actions, tool_schema};
 use anyhow::{Context, Result};

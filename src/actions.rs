@@ -3,7 +3,6 @@ use crate::payment::{
     PaymentFieldMapping, PaymentVault, block_type_on_credential_field, is_sensitive_submit,
 };
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
-use crate::search::duckduckgo_instant_answer;
 use anyhow::{Result, bail};
 use headless_chrome::Tab;
 use schemars::{JsonSchema, schema_for};
@@ -14,10 +13,6 @@ use std::{sync::Arc, thread, time::Duration};
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Action {
-    /// Search DuckDuckGo Instant Answer for facts and entities without using the browser.
-    WebSearch {
-        query: String,
-    },
     /// Navigate the browser to a URL.
     Navigate {
         url: String,
@@ -313,7 +308,6 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
 fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value> {
     let tab = context.tab.as_ref();
     match action {
-        Action::WebSearch { query } => Ok(json!(duckduckgo_instant_answer(query)?)),
         Action::Navigate { url } => {
             tab.navigate_to(url)?;
             let wait_result = tab.wait_until_navigated();
@@ -433,7 +427,6 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
 
 fn op_name(action: &Action) -> &'static str {
     match action {
-        Action::WebSearch { .. } => "webSearch",
         Action::Navigate { .. } => "navigate",
         Action::Observe => "observe",
         Action::Click { .. } => "click",
@@ -466,7 +459,6 @@ fn default_body_selector() -> String {
 
 fn action_detail(action: &Action) -> String {
     match action {
-        Action::WebSearch { query } => format!("webSearch query={query:?}"),
         Action::Navigate { url } => format!("navigate url={url}"),
         Action::Observe => "observe".to_owned(),
         Action::Click { selector } => format!("click selector={selector:?}"),
@@ -1004,14 +996,6 @@ mod tests {
             request.actions[0],
             Action::AutoFillPaymentAndContinue { .. }
         ));
-    }
-
-    #[test]
-    fn parses_web_search_action() {
-        let request: RunRequest =
-            serde_json::from_str(r#"{"actions":[{"op":"webSearch","query":"Ada Lovelace"}]}"#)
-                .unwrap();
-        assert!(matches!(request.actions[0], Action::WebSearch { .. }));
     }
 
     #[test]
