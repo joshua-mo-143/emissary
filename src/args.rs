@@ -15,6 +15,8 @@ pub enum Args {
 pub struct ChatOptions {
     pub new: bool,
     pub resume: Option<String>,
+    pub print: bool,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -41,6 +43,12 @@ enum Command {
         /// Resume a specific conversation session ID.
         #[arg(long, value_name = "SESSION_ID")]
         resume: Option<String>,
+        /// Print a one-shot prompt response as formatted JSON.
+        #[arg(short, long)]
+        print: bool,
+        /// Run a single prompt and exit instead of starting interactive chat.
+        #[arg(value_name = "PROMPT", num_args = 1.., trailing_var_arg = true)]
+        prompt: Vec<String>,
     },
     /// Configure 1Password checkout item references.
     Setup,
@@ -58,11 +66,24 @@ enum Command {
 pub fn parse() -> Result<Args> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Chat { new, resume }) => {
+        Some(Command::Chat {
+            new,
+            resume,
+            print,
+            prompt,
+        }) => {
             if new && resume.is_some() {
                 bail!("--new and --resume cannot be used together");
             }
-            Ok(Args::Chat(ChatOptions { new, resume }))
+            if print && prompt.is_empty() {
+                bail!("--print requires a one-shot prompt");
+            }
+            Ok(Args::Chat(ChatOptions {
+                new,
+                resume,
+                print,
+                prompt: (!prompt.is_empty()).then(|| prompt.join(" ")),
+            }))
         }
         Some(Command::Setup) => Ok(Args::Setup),
         Some(Command::Stop) => Ok(Args::Stop),

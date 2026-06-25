@@ -111,6 +111,25 @@ Do not commit secrets or decrypted item JSON. Emissary reads secrets directly fr
 
 `cargo run -- chat` resumes the most recent conversation when one exists, or creates a new conversation otherwise. Use `cargo run -- chat --new` to force a fresh transcript, or `cargo run -- chat --resume <session-id>` to resume a specific session.
 
+Pass a prompt to `chat` to run one turn and exit:
+
+```sh
+cargo run -- chat --new "Find the current weather in London"
+```
+
+For scripts, add `--print` (`-p`) to keep the final response on stdout as formatted JSON:
+
+```sh
+cargo run -- chat --new --print "Find the current weather in London"
+```
+
+```json
+{
+  "conversationId": "emissary-...",
+  "output": "..."
+}
+```
+
 Conversation transcripts are append-only JSONL files in `.agent-runtime/conversations/` by default. Each line stores one replayable chat message. Emissary prepends a fresh system prompt on every startup so current browser session and payment-profile status stay accurate, then replays the saved non-system messages. Browser screenshots and raw payment data are not persisted in transcripts; screenshot image files remain under the runtime directory and payment/address secrets stay in 1Password.
 
 Type `exit` or press Ctrl+C to stop. Xvfb, VNC, websockify, and Chrome are stopped with the harness.
@@ -256,7 +275,7 @@ Shipping and billing address data can live in the same item or in separate Ident
 
 | command | purpose |
 |---|---|
-| `chat` | start harness + daemon |
+| `chat` | start harness + daemon; accepts an optional one-shot prompt |
 | `setup` | configure gitignored 1Password item references |
 | `stop` | clean stale daemon lock/processes |
 | `schema` | print browser tool schema |
