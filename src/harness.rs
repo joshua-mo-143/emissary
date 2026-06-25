@@ -26,13 +26,18 @@ pub fn chat(options: ChatOptions) -> Result<()> {
     let llm = LlmConfig::load()?;
     let daemon = ManagedDaemon::start()?;
     let status = daemon.status();
-    println!(
+    let ui = if options.print {
+        Ui::stderr()
+    } else {
+        Ui::stdout()
+    };
+    ui.println(format!(
         "Emissary started (session {}, handoff on demand)",
         status
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
-    );
+    ));
 
     let shared = Arc::new(Mutex::new(daemon));
     install_shutdown_handler(shared.clone())?;
@@ -46,18 +51,49 @@ pub fn chat(options: ChatOptions) -> Result<()> {
         guard.payment_keys()
     };
     let mut conversation =
-        ConversationStore::new(&runtime_dir).open(conversation_selection(options))?;
+        ConversationStore::new(&runtime_dir).open(conversation_selection(&options))?;
     let mut messages = vec![ChatMessage::system(system_prompt(&payment_keys, &status))];
     messages.extend(conversation.messages().iter().cloned());
     match conversation.origin() {
-        ConversationOrigin::New => println!("Conversation: {} (new)", conversation.id()),
-        ConversationOrigin::Resumed => println!(
+        ConversationOrigin::New => ui.println(format!("Conversation: {} (new)", conversation.id())),
+        ConversationOrigin::Resumed => ui.println(format!(
             "Conversation: {} (resumed, {} messages)",
             conversation.id(),
             conversation.messages().len()
-        ),
+        )),
     }
     let tool = openai_tool(&schema);
+    if let Some(prompt) = options.prompt.as_deref() {
+        let reply = run_prompt(
+            prompt,
+            &shared,
+            &llm,
+            &tool,
+            &mut messages,
+            &runtime_dir,
+            &mut conversation,
+            ui,
+        )?;
+        if options.print {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&PrintResponse {
+                    conversation_id: conversation.id(),
+                    output: &reply.text,
+                })?
+            );
+        } else {
+            println!("{}", reply.text);
+        }
+        shared.lock().expect("daemon mutex poisoned").shutdown();
+        if !options.print {
+            println!("Emissary stopped.");
+        } else {
+            eprintln!("Emissary stopped.");
+        }
+        return Ok(());
+    }
+
     println!("Type a message, or 'exit' to quit.\n");
 
     loop {
@@ -75,19 +111,16 @@ pub fn chat(options: ChatOptions) -> Result<()> {
             break;
         }
 
-        let user_message = ChatMessage::user(line);
-        conversation.append_message(&user_message)?;
-        messages.push(user_message);
-        let reply = run_agent_turn(
+        let reply = run_prompt(
+            line,
             &shared,
             &llm,
             &tool,
             &mut messages,
             &runtime_dir,
             &mut conversation,
+            ui,
         )?;
-        conversation.append_message(&reply.message)?;
-        messages.push(reply.message);
         println!("\nassistant> {}\n", reply.text);
     }
 
@@ -96,11 +129,54 @@ pub fn chat(options: ChatOptions) -> Result<()> {
     Ok(())
 }
 
-fn conversation_selection(options: ChatOptions) -> ConversationSelection {
+#[derive(Clone, Copy)]
+struct Ui {
+    stream: UiStream,
+}
+
+#[derive(Clone, Copy)]
+enum UiStream {
+    Stdout,
+    Stderr,
+}
+
+impl Ui {
+    fn stdout() -> Self {
+        Self {
+            stream: UiStream::Stdout,
+        }
+    }
+
+    fn stderr() -> Self {
+        Self {
+            stream: UiStream::Stderr,
+        }
+    }
+
+    fn println(&self, message: impl std::fmt::Display) {
+        match self.stream {
+            UiStream::Stdout => println!("{message}"),
+            UiStream::Stderr => eprintln!("{message}"),
+        }
+    }
+
+    fn is_stderr(&self) -> bool {
+        matches!(self.stream, UiStream::Stderr)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrintResponse<'a> {
+    conversation_id: &'a str,
+    output: &'a str,
+}
+
+fn conversation_selection(options: &ChatOptions) -> ConversationSelection {
     if options.new {
         ConversationSelection::New
-    } else if let Some(id) = options.resume {
-        ConversationSelection::Resume(id)
+    } else if let Some(id) = &options.resume {
+        ConversationSelection::Resume(id.clone())
     } else {
         ConversationSelection::ResumeLatest
     }
@@ -299,6 +375,25 @@ struct AgentReply {
     text: String,
 }
 
+fn run_prompt(
+    prompt: &str,
+    daemon: &Arc<Mutex<ManagedDaemon>>,
+    llm: &LlmConfig,
+    tool: &Value,
+    messages: &mut Vec<ChatMessage>,
+    runtime_dir: &PathBuf,
+    conversation: &mut ConversationSession,
+    ui: Ui,
+) -> Result<AgentReply> {
+    let user_message = ChatMessage::user(prompt);
+    conversation.append_message(&user_message)?;
+    messages.push(user_message);
+    let reply = run_agent_turn(daemon, llm, tool, messages, runtime_dir, conversation, ui)?;
+    conversation.append_message(&reply.message)?;
+    messages.push(reply.message.clone());
+    Ok(reply)
+}
+
 fn run_agent_turn(
     daemon: &Arc<Mutex<ManagedDaemon>>,
     llm: &LlmConfig,
@@ -306,6 +401,7 @@ fn run_agent_turn(
     messages: &mut Vec<ChatMessage>,
     runtime_dir: &PathBuf,
     conversation: &mut ConversationSession,
+    ui: Ui,
 ) -> Result<AgentReply> {
     let mut post_tool_followup_pending = false;
 
@@ -352,12 +448,12 @@ fn run_agent_turn(
                         let response =
                             daemon.lock().expect("daemon mutex poisoned").run(actions)?;
                         if response.needs_human_handoff() {
-                            show_handoff_to_user(response.body(), runtime_dir)?;
+                            show_handoff_to_user(response.body(), runtime_dir, ui)?;
                         } else if response.is_error() {
                             show_browser_error_to_user(response.body());
                             stop_after_tool_error = true;
                         } else {
-                            show_browser_images_to_user(response.body(), runtime_dir)?;
+                            show_browser_images_to_user(response.body(), runtime_dir, ui)?;
                             successful_tool_result = true;
                         }
                         format_tool_result_for_model(response.body())
@@ -553,9 +649,9 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
     )
 }
 
-fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
+fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf, ui: Ui) -> Result<()> {
     if let Some(reason) = body.get("reason").and_then(Value::as_str) {
-        println!("\n[handoff] {reason}");
+        ui.println(format!("\n[handoff] {reason}"));
     }
 
     if let Some(summary) = body
@@ -563,7 +659,7 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
     {
-        println!("\n--- Order review ---\n{summary}");
+        ui.println(format!("\n--- Order review ---\n{summary}"));
     }
 
     if let Some(note) = body
@@ -571,7 +667,7 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
     {
-        println!("\n[review] {note}");
+        ui.println(format!("\n[review] {note}"));
     }
 
     if let Some(screenshot) = body
@@ -584,6 +680,7 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
             "review-latest.png",
             screenshot,
             runtime_dir,
+            ui,
         )?;
     }
 
@@ -593,11 +690,11 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         } else {
             "Open for submit or bank auth"
         };
-        println!("\n{label}: {url}");
+        ui.println(format!("\n{label}: {url}"));
     }
 
     if body.get("mode") == Some(&json!("blocked")) {
-        println!(
+        ui.println(
             "\nCloudflare is blocking the automated browser. If the challenge never fully loads in noVNC, continue in a normal browser or choose another site."
         );
     } else if body.get("mode") == Some(&json!("interactive")) {
@@ -608,14 +705,16 @@ fn show_handoff_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
         if reason.contains("bot challenge")
             || body.get("pageState") == Some(&json!("bot_challenge"))
         {
-            println!(
+            ui.println(
                 "\nSites like Uber Eats often block automation behind Cloudflare. Complete the check in the handoff browser, then tell Emissary you are done."
             );
         } else {
-            println!("\nComplete authentication in the browser, then tell Emissary you are done.");
+            ui.println(
+                "\nComplete authentication in the browser, then tell Emissary you are done.",
+            );
         }
     } else {
-        println!(
+        ui.println(
             "\nReview the order, submit via the handoff browser if it looks right, then say you are done."
         );
     }
@@ -630,7 +729,7 @@ struct BrowserImage {
     note: Option<String>,
 }
 
-fn show_browser_images_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()> {
+fn show_browser_images_to_user(body: &Value, runtime_dir: &PathBuf, ui: Ui) -> Result<()> {
     let mut images = Vec::new();
     collect_browser_images(body, &mut images);
 
@@ -640,10 +739,10 @@ fn show_browser_images_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()
             .as_deref()
             .filter(|text| !text.trim().is_empty())
         {
-            println!("\n--- Order review ---\n{summary}");
+            ui.println(format!("\n--- Order review ---\n{summary}"));
         }
         if let Some(note) = image.note.as_deref().filter(|text| !text.trim().is_empty()) {
-            println!("\n[image] {note}");
+            ui.println(format!("\n[image] {note}"));
         }
 
         let filename = if image.label == "Order review screenshot" {
@@ -658,6 +757,7 @@ fn show_browser_images_to_user(body: &Value, runtime_dir: &PathBuf) -> Result<()
             &filename,
             &image.screenshot_base64,
             runtime_dir,
+            ui,
         )?;
     }
 
@@ -719,15 +819,18 @@ fn show_browser_image(
     filename: &str,
     screenshot_base64: &str,
     runtime_dir: &PathBuf,
+    ui: Ui,
 ) -> Result<()> {
-    println!("\n--- {label} ---");
+    ui.println(format!("\n--- {label} ---"));
     let path = image_display::save_base64_png(runtime_dir, filename, screenshot_base64)?;
-    match image_display::render_inline(&path) {
-        InlineImageResult::Rendered => {}
-        InlineImageResult::Skipped => {}
-        InlineImageResult::Failed(error) => eprintln!("[image] inline render failed: {error}"),
+    if !ui.is_stderr() {
+        match image_display::render_inline(&path) {
+            InlineImageResult::Rendered => {}
+            InlineImageResult::Skipped => {}
+            InlineImageResult::Failed(error) => eprintln!("[image] inline render failed: {error}"),
+        }
     }
-    println!("Image saved: {}", path.display());
+    ui.println(format!("Image saved: {}", path.display()));
     Ok(())
 }
 
