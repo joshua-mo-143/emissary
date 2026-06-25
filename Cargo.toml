@@ -13,6 +13,7 @@ reqwest = { version = "0.12.15", default-features = false, features = ["blocking
 ctrlc = "3.4.7"
 viuer = { version = "0.11.0", features = ["print-file"], optional = true }
 schemars = { version = "1.2.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 [features]
 default = ["terminal-images"]

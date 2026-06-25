@@ -1,4 +1,5 @@
 mod actions;
+mod args;
 mod browser_dom;
 mod daemon;
 mod harness;
@@ -8,33 +9,31 @@ mod review;
 mod search;
 
 use actions::{RunContext, outcome_to_json, run_actions, tool_schema};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use args::Args;
 use daemon::{ManagedDaemon, headless, launch_browser_ephemeral, parse_run_request, session_id};
 use payment::{OnePasswordSetup, PaymentVault};
 use std::{
     fs,
     io::{self, Read, Write},
+    path::Path,
 };
 
 fn main() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    match args.first().map(String::as_str) {
-        Some("chat") => harness::chat(),
-        Some("stop") => ManagedDaemon::stop_stale(),
-        Some("setup") => setup_cli(),
-        Some("run") => run_cli(&args[1..]),
-        Some("schema") => {
+    match args::parse()? {
+        Args::Chat => harness::chat(),
+        Args::Stop => ManagedDaemon::stop_stale(),
+        Args::Setup => setup_cli(),
+        Args::Run { request_json } => run_cli(request_json.as_deref()),
+        Args::Schema => {
             println!("{}", serde_json::to_string_pretty(&tool_schema())?);
             Ok(())
         }
-        None => bail!("{}", usage()),
-        Some(path) if path.ends_with(".json") => run_cli(&[path.to_string()]),
-        Some(_) => bail!("{}", usage()),
     }
 }
 
-fn run_cli(args: &[String]) -> Result<()> {
-    let request = read_run_request(args)?;
+fn run_cli(request_json: Option<&Path>) -> Result<()> {
+    let request = read_run_request(request_json)?;
     let payment = PaymentVault::load()?;
     let browser = launch_browser_ephemeral(headless(), None)?;
     let tab = browser.new_tab()?;
@@ -79,10 +78,10 @@ fn setup_cli() -> Result<()> {
     Ok(())
 }
 
-fn read_run_requests(args: &[String]) -> Result<String> {
-    match args.first() {
+fn read_run_requests(request_json: Option<&Path>) -> Result<String> {
+    match request_json {
         Some(path) => fs::read_to_string(path)
-            .with_context(|| format!("failed to read run request from {path}")),
+            .with_context(|| format!("failed to read run request from {}", path.display())),
         None => {
             let mut body = String::new();
             std::io::stdin().read_to_string(&mut body)?;
@@ -91,8 +90,8 @@ fn read_run_requests(args: &[String]) -> Result<String> {
     }
 }
 
-fn read_run_request(args: &[String]) -> Result<actions::RunRequest> {
-    parse_run_request(&read_run_requests(args)?)
+fn read_run_request(request_json: Option<&Path>) -> Result<actions::RunRequest> {
+    parse_run_request(&read_run_requests(request_json)?)
 }
 
 fn prompt_required(label: &str) -> Result<String> {
@@ -116,21 +115,4 @@ fn prompt(label: &str) -> Result<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_owned())
-}
-
-fn usage() -> &'static str {
-    r#"Usage:
-  cargo run -- chat
-  cargo run -- setup
-  cargo run -- stop
-  cargo run -- schema
-  cargo run -- run [request.json]
-  cargo run -- request.json
-
-  chat    start Emissary and the browser daemon together
-  setup   configure 1Password checkout item references
-  stop    clean up a stale daemon lock/processes
-  run     execute JSON browser actions once (separate headless session)
-
-Set VENICE_API_KEY before chat."#
 }

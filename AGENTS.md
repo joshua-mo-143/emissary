@@ -6,7 +6,8 @@ Emissary is a minimal Rust assistant harness with a browser-use tool. One binary
 
 ```text
 src/
-  main.rs      CLI entry: chat | stop | run | schema
+  main.rs      Thin CLI dispatch: chat | setup | stop | run | schema
+  args.rs      Clap derive parser and CLI argument normalization
   harness.rs   Venice AI chat loop + browser tool dispatch
   daemon.rs    ManagedDaemon: display stack, Chrome, lock file, shutdown
   actions.rs   JSON browser actions (RunRequest / Action enum)
@@ -63,6 +64,7 @@ Follow these conventions when editing this repo.
 ### Structure
 
 - Keep modules focused: `actions` = browser DSL, `daemon` = process lifecycle, `harness` = LLM loop, `payment` / `review` = domain logic.
+- Keep `main.rs` thin. Put Clap derive types, command parsing, and CLI argument normalization in `args.rs`; `main.rs` should mostly dispatch parsed commands.
 - Prefer `Result<T>` with `anyhow::Context` for CLI/harness errors; attach context at boundaries (`?` with `.context("…")`).
 - Use `serde` with `#[serde(tag = "op", rename_all = "camelCase")]` for externally visible JSON enums.
 - Put tests next to the module they exercise (`#[cfg(test)] mod tests` in the same file).
