@@ -2,7 +2,7 @@
 
 Emissary is a minimal assistant harness with a built-in browser-use tool. One command starts the LLM chat and the headed Chrome daemon together, and stopping Emissary tears everything down.
 
-Cookies and login state persist in `automation-profile/`.
+Cookies and login state persist in `automation-profile/`. Chat conversations persist separately under `.agent-runtime/conversations/`.
 
 ## Architecture
 
@@ -107,6 +107,12 @@ op item get "Home Address" --format json
 
 Do not commit secrets or decrypted item JSON. Emissary reads secrets directly from `op` when payment profiles are configured and keeps card/address values out of LLM prompts and tool results.
 
+### Persistent Conversations
+
+`cargo run -- chat` resumes the most recent conversation when one exists, or creates a new conversation otherwise. Use `cargo run -- chat --new` to force a fresh transcript, or `cargo run -- chat --resume <session-id>` to resume a specific session.
+
+Conversation transcripts are append-only JSONL files in `.agent-runtime/conversations/` by default. Each line stores one replayable chat message. Emissary prepends a fresh system prompt on every startup so current browser session and payment-profile status stay accurate, then replays the saved non-system messages. Browser screenshots and raw payment data are not persisted in transcripts; screenshot image files remain under the runtime directory and payment/address secrets stay in 1Password.
+
 Type `exit` or press Ctrl+C to stop. Xvfb, VNC, websockify, and Chrome are stopped with the harness.
 
 If a previous run crashed and left processes behind:
@@ -123,7 +129,7 @@ cargo run -- stop
 | `VENICE_BASE_URL` | `https://api.venice.ai/api/v1` | Venice API base URL |
 | `VENICE_MODEL` | `deepseek-v4-flash` | chat model |
 | `VENICE_TIMEOUT_SECS` | `300` | total timeout for each Venice chat completion request |
-| `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file + review screenshots |
+| `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file, conversation transcripts, and review screenshots |
 | `EMISSARY_IMAGE_DISPLAY` | `auto` | image preview mode: `auto`, `inline`, `path`, or `off` |
 | `PAYMENT_1PASSWORD_ITEM` | unset | 1Password item title/ID to load as the `default` payment profile |
 | `PAYMENT_1PASSWORD_ITEMS` | unset | JSON object of profile keys to 1Password item specs |

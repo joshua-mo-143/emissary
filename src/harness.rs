@@ -1,4 +1,8 @@
 use crate::actions::{Action, BrowserToolArguments};
+use crate::args::ChatOptions;
+use crate::conversation::{
+    ConversationOrigin, ConversationSelection, ConversationSession, ConversationStore,
+};
 use crate::daemon::{ManagedDaemon, install_shutdown_handler, runtime_dir};
 use crate::image_display::{self, InlineImageResult};
 use anyhow::{Context, Result, bail};
@@ -17,7 +21,7 @@ Continue the user's task now. Your previous response looked like an intermediate
 after a browser tool result, not a final answer. If the task is complete or you need user input, \
 state that clearly; otherwise call the browser tool for the next step.";
 
-pub fn chat() -> Result<()> {
+pub fn chat(options: ChatOptions) -> Result<()> {
     let runtime_dir = runtime_dir()?;
     let llm = LlmConfig::load()?;
     let daemon = ManagedDaemon::start()?;
@@ -41,7 +45,18 @@ pub fn chat() -> Result<()> {
         let guard = shared.lock().expect("daemon mutex poisoned");
         guard.payment_keys()
     };
+    let mut conversation =
+        ConversationStore::new(&runtime_dir).open(conversation_selection(options))?;
     let mut messages = vec![ChatMessage::system(system_prompt(&payment_keys, &status))];
+    messages.extend(conversation.messages().iter().cloned());
+    match conversation.origin() {
+        ConversationOrigin::New => println!("Conversation: {} (new)", conversation.id()),
+        ConversationOrigin::Resumed => println!(
+            "Conversation: {} (resumed, {} messages)",
+            conversation.id(),
+            conversation.messages().len()
+        ),
+    }
     let tool = openai_tool(&schema);
     println!("Type a message, or 'exit' to quit.\n");
 
@@ -60,8 +75,18 @@ pub fn chat() -> Result<()> {
             break;
         }
 
-        messages.push(ChatMessage::user(line));
-        let reply = run_agent_turn(&shared, &llm, &tool, &mut messages, &runtime_dir)?;
+        let user_message = ChatMessage::user(line);
+        conversation.append_message(&user_message)?;
+        messages.push(user_message);
+        let reply = run_agent_turn(
+            &shared,
+            &llm,
+            &tool,
+            &mut messages,
+            &runtime_dir,
+            &mut conversation,
+        )?;
+        conversation.append_message(&reply.message)?;
         messages.push(reply.message);
         println!("\nassistant> {}\n", reply.text);
     }
@@ -69,6 +94,16 @@ pub fn chat() -> Result<()> {
     shared.lock().expect("daemon mutex poisoned").shutdown();
     println!("Emissary stopped.");
     Ok(())
+}
+
+fn conversation_selection(options: ChatOptions) -> ConversationSelection {
+    if options.new {
+        ConversationSelection::New
+    } else if let Some(id) = options.resume {
+        ConversationSelection::Resume(id)
+    } else {
+        ConversationSelection::ResumeLatest
+    }
 }
 
 struct LlmConfig {
@@ -79,7 +114,7 @@ struct LlmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatMessage {
+pub(crate) struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -90,7 +125,7 @@ struct ChatMessage {
 }
 
 impl ChatMessage {
-    fn system(content: impl Into<String>) -> Self {
+    pub(crate) fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_owned(),
             content: Some(content.into()),
@@ -99,7 +134,7 @@ impl ChatMessage {
         }
     }
 
-    fn user(content: impl Into<String>) -> Self {
+    pub(crate) fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_owned(),
             content: Some(content.into()),
@@ -108,7 +143,7 @@ impl ChatMessage {
         }
     }
 
-    fn assistant_text(content: impl Into<String>) -> Self {
+    pub(crate) fn assistant_text(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_owned(),
             content: Some(content.into()),
@@ -117,7 +152,7 @@ impl ChatMessage {
         }
     }
 
-    fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub(crate) fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_owned(),
             content: Some(content.into()),
@@ -126,8 +161,12 @@ impl ChatMessage {
         }
     }
 
-    fn content_text(&self) -> &str {
+    pub(crate) fn content_text(&self) -> &str {
         self.content.as_deref().unwrap_or_default()
+    }
+
+    pub(crate) fn is_system(&self) -> bool {
+        self.role == "system"
     }
 }
 
@@ -266,6 +305,7 @@ fn run_agent_turn(
     tool: &Value,
     messages: &mut Vec<ChatMessage>,
     runtime_dir: &PathBuf,
+    conversation: &mut ConversationSession,
 ) -> Result<AgentReply> {
     let mut post_tool_followup_pending = false;
 
@@ -276,8 +316,12 @@ fn run_agent_turn(
         if tool_calls.is_empty() {
             let text = response.content_text().to_owned();
             if post_tool_followup_pending && should_auto_continue_after_tool_response(&text) {
-                messages.push(ChatMessage::assistant_text(text));
-                messages.push(ChatMessage::user(POST_TOOL_CONTINUE_PROMPT));
+                let assistant_message = ChatMessage::assistant_text(text);
+                conversation.append_message(&assistant_message)?;
+                messages.push(assistant_message);
+                let continue_message = ChatMessage::user(POST_TOOL_CONTINUE_PROMPT);
+                conversation.append_message(&continue_message)?;
+                messages.push(continue_message);
                 post_tool_followup_pending = false;
                 continue;
             }
@@ -289,6 +333,7 @@ fn run_agent_turn(
         }
 
         post_tool_followup_pending = false;
+        conversation.append_message(&response)?;
         messages.push(response);
 
         for call in tool_calls {
@@ -324,7 +369,9 @@ fn run_agent_turn(
                 }
             };
 
-            messages.push(ChatMessage::tool(call_id, tool_content));
+            let tool_message = ChatMessage::tool(call_id, tool_content);
+            conversation.append_message(&tool_message)?;
+            messages.push(tool_message);
             post_tool_followup_pending |= successful_tool_result;
 
             if stop_after_tool_error {
