@@ -111,6 +111,9 @@ pub fn chat(options: ChatOptions) -> Result<()> {
             break;
         }
 
+        println!("\nassistant> Working... input is paused until I finish.");
+        io::stdout().flush()?;
+        let _input_guard = TerminalInputGuard::block();
         let reply = run_prompt(
             line,
             &shared,
@@ -170,6 +173,92 @@ impl Ui {
 struct PrintResponse<'a> {
     conversation_id: &'a str,
     output: &'a str,
+}
+
+struct TerminalInputGuard {
+    #[cfg(unix)]
+    active: bool,
+}
+
+#[cfg(unix)]
+static TERMINAL_RESTORE_ON_EXIT: std::sync::Once = std::sync::Once::new();
+
+#[cfg(unix)]
+static TERMINAL_ORIGINAL: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+impl TerminalInputGuard {
+    fn block() -> Self {
+        #[cfg(unix)]
+        {
+            Self::block_unix()
+        }
+
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn block_unix() -> Self {
+        TERMINAL_RESTORE_ON_EXIT.call_once(|| unsafe {
+            libc::atexit(restore_terminal_input_at_exit);
+        });
+
+        let fd = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Self { active: false };
+        }
+
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Self { active: false };
+        }
+
+        let original = unsafe { original.assume_init() };
+        let mut blocked = original;
+        blocked.c_lflag &= !(libc::ECHO | libc::ICANON);
+        blocked.c_cc[libc::VMIN] = 0;
+        blocked.c_cc[libc::VTIME] = 0;
+
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &blocked) } != 0 {
+            return Self { active: false };
+        }
+
+        *TERMINAL_ORIGINAL.lock().expect("terminal mutex poisoned") = Some(original);
+        Self { active: true }
+    }
+}
+
+impl Drop for TerminalInputGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.active {
+            restore_terminal_input();
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn restore_terminal_input_at_exit() {
+    restore_terminal_input();
+}
+
+#[cfg(unix)]
+fn restore_terminal_input() {
+    let Some(original) = TERMINAL_ORIGINAL
+        .lock()
+        .expect("terminal mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+
+    let fd = libc::STDIN_FILENO;
+    unsafe {
+        libc::tcflush(fd, libc::TCIFLUSH);
+        libc::tcsetattr(fd, libc::TCSANOW, &original);
+    }
 }
 
 fn conversation_selection(options: &ChatOptions) -> ConversationSelection {
