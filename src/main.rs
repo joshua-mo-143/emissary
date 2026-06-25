@@ -1,6 +1,7 @@
 mod actions;
 mod args;
 mod browser_dom;
+mod conversation;
 mod daemon;
 mod harness;
 mod image_display;
@@ -21,7 +22,7 @@ use std::{
 
 fn main() -> Result<()> {
     match args::parse()? {
-        Args::Chat => harness::chat(),
+        Args::Chat(options) => harness::chat(options),
         Args::Stop => ManagedDaemon::stop_stale(),
         Args::Setup => setup_cli(),
         Args::Run { request_json } => run_cli(request_json.as_deref()),

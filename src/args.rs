@@ -4,11 +4,17 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Args {
-    Chat,
+    Chat(ChatOptions),
     Setup,
     Stop,
     Run { request_json: Option<PathBuf> },
     Schema,
+}
+
+#[derive(Debug)]
+pub struct ChatOptions {
+    pub new: bool,
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -28,7 +34,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start Emissary and the browser daemon together.
-    Chat,
+    Chat {
+        /// Start a fresh conversation instead of resuming the latest one.
+        #[arg(long)]
+        new: bool,
+        /// Resume a specific conversation session ID.
+        #[arg(long, value_name = "SESSION_ID")]
+        resume: Option<String>,
+    },
     /// Configure 1Password checkout item references.
     Setup,
     /// Clean up a stale daemon lock/processes.
@@ -45,7 +58,12 @@ enum Command {
 pub fn parse() -> Result<Args> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Chat) => Ok(Args::Chat),
+        Some(Command::Chat { new, resume }) => {
+            if new && resume.is_some() {
+                bail!("--new and --resume cannot be used together");
+            }
+            Ok(Args::Chat(ChatOptions { new, resume }))
+        }
         Some(Command::Setup) => Ok(Args::Setup),
         Some(Command::Stop) => Ok(Args::Stop),
         Some(Command::Run { request_json }) => Ok(Args::Run { request_json }),
