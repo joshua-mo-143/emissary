@@ -529,6 +529,7 @@ dependencies = [
  "base64",
  "ctrlc",
  "headless_chrome",
+ "libc",
  "reqwest",
  "schemars",
  "serde",
