@@ -626,6 +626,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "headless_chrome",
+ "libc",
  "reqwest",
  "schemars",
  "serde",
