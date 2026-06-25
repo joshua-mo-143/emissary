@@ -1,8 +1,16 @@
 # Emissary
 
-Emissary is a minimal assistant harness with a built-in browser-use tool. One command starts the LLM chat and the headed Chrome daemon together, and stopping Emissary tears everything down.
+Emissary is an agentic browser-use tool: a Rust CLI that gives an LLM a guarded, persistent Chrome session for real web tasks. It can navigate pages, observe visible controls, click and type through stable element refs, capture product/order screenshots, fill checkout fields from 1Password, and pause for human review before sensitive submits.
 
-Cookies and login state persist in `automation-profile/`. Chat conversations persist separately under `.agent-runtime/conversations/`.
+One command starts both the chat loop and the headed browser stack. Cookies and login state persist in `automation-profile/`; conversations, lock files, and review screenshots live under `.agent-runtime/`.
+
+## What Emissary Does
+
+- Runs a managed local Chrome session with Xvfb, noVNC, and websockify.
+- Exposes one LLM tool, `browser`, with whitelisted JSON actions.
+- Prefers `observe` -> `clickRef` / `typeRef` so the agent acts on visible page elements instead of brittle selectors.
+- Keeps payment and address secrets out of prompts by loading checkout data directly from 1Password.
+- Blocks final purchase submits and bank/app authentication behind explicit human handoff.
 
 ## Architecture
 
@@ -10,12 +18,13 @@ Cookies and login state persist in `automation-profile/`. Chat conversations per
 cargo run -- chat
   ├─ harness (LLM loop)          src/harness.rs
   └─ ManagedDaemon               src/daemon.rs
-       ├─ Xvfb + noVNC + Chrome
-       ├─ payment vault + guardrails
+       ├─ Xvfb + noVNC + Chromium/Chrome
+       ├─ browser action executor
+       ├─ payment vault + checkout guardrails
        └─ shutdown on exit / Ctrl+C
 ```
 
-There is no separate long-lived `serve` step. The browser daemon lifetime matches the Emissary session.
+There is no separate long-lived server. The browser daemon lifetime matches the Emissary chat session and is torn down on `exit`, normal return, or Ctrl+C.
 
 ## Quick start
 
@@ -143,14 +152,15 @@ cargo run -- stop
 | `IDLE_BROWSER_TIMEOUT_SECS` | `3600` | CDP idle timeout; headless_chrome defaults to 30s, which breaks chat while waiting on the LLM |
 | `VNC_PORT`, `NOVNC_PORT`, `SCREEN`, … | see daemon | display stack tuning |
 
-## Browser tool
+## Browser Tool
 
-The harness calls the browser in-process (no HTTP hop during chat). Actions are JSON:
+The LLM gets a single tool named `browser`. The harness executes browser actions in-process against the managed Chrome session, so navigation, cookies, logins, screenshots, and handoff state all stay in the same session.
+
+Actions are ordered JSON batches:
 
 ```json
 {
   "actions": [
-    { "op": "webSearch", "query": "Ada Lovelace" },
     { "op": "navigate", "url": "https://example.com" },
     { "op": "observe" },
     { "op": "clickRef", "refId": "e1" }
@@ -160,13 +170,30 @@ The harness calls the browser in-process (no HTTP hop during chat). Actions are 
 
 Schema: `cargo run -- schema`
 
-`webSearch` uses DuckDuckGo Instant Answer for lightweight fact/entity lookup without driving the browser.
+For discovery and reading, Emissary uses the browser itself: navigate to known URLs or search engines, observe the page, then follow result links with refs.
 
-Prefer the ref flow for dynamic consumer sites:
+### Ref-Based Interaction
+
+Prefer refs for dynamic consumer sites:
 
 1. `observe` returns visible page text plus `elements` like `{ "ref": "e1", "kind": "button", "label": "Search" }`; accessible iframe controls include a `frame` label but use the same ref actions.
 2. Use `clickRef` / `typeRef` with those refs instead of guessing CSS selectors.
 3. Fall back to `click`, `type`, or `html` only when refs are insufficient.
+
+Example search-like flow through the browser:
+
+```json
+{
+  "actions": [
+    { "op": "navigate", "url": "https://www.google.com/search?q=Ada+Lovelace" },
+    { "op": "observe" },
+    { "op": "clickRef", "refId": "e3" },
+    { "op": "observe" }
+  ]
+}
+```
+
+### Checkout Automation
 
 For payment forms, use the same ref flow without exposing card values:
 

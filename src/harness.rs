@@ -599,9 +599,9 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          Use the browser tool to carry out web tasks in a persistent Chrome session. \
          Send short ordered batches of JSON actions. Each tool result includes `title` and \
          `pageText` plus `elements` refs (visible controls after the batch finishes, including accessible iframe contents). Use `html` only when you need markup.\n\
-         Search:\n\
-         - Use webSearch for factual/entity lookup via DuckDuckGo Instant Answer before opening fragile browser pages.\n\
-         - webSearch is for discovery and reading; browser is for interactive/session tasks.\n\
+         Discovery:\n\
+         - Use the persistent browser session for discovery, reading, and interaction. \
+         Navigate to search engines or known sites when the user needs information from the web.\n\
          Selectors:\n\
          - Prefer observe -> clickRef/typeRef. Do not invent CSS selectors when an element ref is available.\n\
          - Element refs may include a `frame` label for iframe contents; use the same clickRef/typeRef/fillPaymentRefs actions with those refs.\n\
@@ -928,9 +928,11 @@ mod tests {
 
     #[test]
     fn parses_browser_tool_arguments() {
-        let actions =
-            parse_browser_arguments(r#"{"actions":[{"op":"webSearch","query":"rust"}]}"#).unwrap();
-        assert!(matches!(actions[0], Action::WebSearch { .. }));
+        let actions = parse_browser_arguments(
+            r#"{"actions":[{"op":"navigate","url":"https://example.com"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(actions[0], Action::Navigate { .. }));
     }
 
     #[test]
