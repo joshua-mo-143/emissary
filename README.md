@@ -1,30 +1,16 @@
 # Emissary
 
-Emissary is an agentic browser-use tool: a Rust CLI that gives an LLM a guarded, persistent Chrome session for real web tasks. It can navigate pages, observe visible controls, click and type through stable element refs, capture product/order screenshots, fill checkout fields from 1Password, and pause for human review before sensitive submits.
+ Emissary is a local, user-authorized browser agent for workflows that require handling of sensitive information like credit card information and secrets. It can buy your groceries, pay your bills (literally) and browse the Internet safely - with privacy baked in.  
 
-One command starts both the chat loop and the headed browser stack. Cookies and login state persist in `automation-profile/`; conversations, lock files, and review screenshots live under `.agent-runtime/`.
+This codebase is still early stage. Expect breaking changes.
 
 ## What Emissary Does
 
 - Runs a managed local Chrome session with Xvfb, noVNC, and websockify.
 - Exposes one LLM tool, `browser`, with whitelisted JSON actions.
-- Prefers `observe` -> `clickRef` / `typeRef` so the agent acts on visible page elements instead of brittle selectors.
+- Prefers `observe` -&gt; `clickRef` / `typeRef` so the agent acts on visible page elements instead of brittle selectors.
 - Keeps payment and address secrets out of prompts by loading checkout data directly from 1Password.
 - Blocks final purchase submits and bank/app authentication behind explicit human handoff.
-
-## Architecture
-
-```text
-cargo run -- chat
-  ├─ harness (LLM loop)          src/harness.rs
-  └─ ManagedDaemon               src/daemon.rs
-       ├─ Xvfb + noVNC + Chromium/Chrome
-       ├─ browser action executor
-       ├─ payment vault + checkout guardrails
-       └─ shutdown on exit / Ctrl+C
-```
-
-There is no separate long-lived server. The browser daemon lifetime matches the Emissary chat session and is torn down on `exit`, normal return, or Ctrl+C.
 
 ## Quick start
 
@@ -32,7 +18,7 @@ There is no separate long-lived server. The browser daemon lifetime matches the 
 sudo apt install xvfb x11vnc novnc websockify chromium
 
 export VENICE_API_KEY=...
-cargo run -- chat
+cargo run chat
 ```
 
 Emissary auto-detects Chromium/Chrome on `PATH` (including `/snap/bin/chromium`). Override with `CHROME=/path/to/browser` if needed.
@@ -51,9 +37,7 @@ op signin
 ```
 
 2. Create or choose a 1Password **Credit Card** item for the card Emissary should use. Standard card fields work out of the box.
-
 3. Optional: create or choose an **Identity** item for checkout addresses. Use one shared address item, or separate billing and shipping items when they differ.
-
 4. Run the setup wizard and enter item titles or IDs when prompted:
 
 ```sh
@@ -151,25 +135,27 @@ cargo run -- stop
 
 ## Environment
 
-| variable | default | purpose |
-|---|---|---|
-| `VENICE_API_KEY` | required | Venice AI API key |
-| `VENICE_BASE_URL` | `https://api.venice.ai/api/v1` | Venice API base URL |
-| `VENICE_MODEL` | `deepseek-v4-flash` | chat model |
-| `VENICE_TIMEOUT_SECS` | `300` | total timeout for each Venice chat completion request |
-| `EMISSARY_RUNTIME_DIR` | `.agent-runtime` | lock file, conversation transcripts, and review screenshots |
-| `EMISSARY_IMAGE_DISPLAY` | `auto` | image preview mode: `auto`, `inline`, `path`, or `off` |
-| `PAYMENT_1PASSWORD_ITEM` | unset | 1Password item title/ID to load as the `default` payment profile |
-| `PAYMENT_1PASSWORD_ITEMS` | unset | JSON object of profile keys to 1Password item specs |
-| `PAYMENT_1PASSWORD_PROFILE` | `default` | profile key for `PAYMENT_1PASSWORD_ITEM` |
-| `PAYMENT_1PASSWORD_ADDRESS_ITEM` | unset | optional Identity/address item used for both billing and shipping |
-| `PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM` | unset | optional billing Identity/address item |
-| `PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM` | unset | optional shipping Identity/address item |
-| `PAYMENT_1PASSWORD_VAULT` | unset | optional 1Password vault passed to `op item get --vault` |
-| `OP_CLI` | `op` | 1Password CLI executable |
-| `CHROME` | auto-detect | Chromium/Chrome binary path |
-| `IDLE_BROWSER_TIMEOUT_SECS` | `3600` | CDP idle timeout; headless_chrome defaults to 30s, which breaks chat while waiting on the LLM |
-| `VNC_PORT`, `NOVNC_PORT`, `SCREEN`, … | see daemon | display stack tuning |
+
+| variable                                  | default                        | purpose                                                                                       |
+| ----------------------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `VENICE_API_KEY`                          | required                       | Venice AI API key                                                                             |
+| `VENICE_BASE_URL`                         | `https://api.venice.ai/api/v1` | Venice API base URL                                                                           |
+| `VENICE_MODEL`                            | `deepseek-v4-flash`            | chat model                                                                                    |
+| `VENICE_TIMEOUT_SECS`                     | `300`                          | total timeout for each Venice chat completion request                                         |
+| `EMISSARY_RUNTIME_DIR`                    | `.agent-runtime`               | lock file, conversation transcripts, and review screenshots                                   |
+| `EMISSARY_IMAGE_DISPLAY`                  | `auto`                         | image preview mode: `auto`, `inline`, `path`, or `off`                                        |
+| `PAYMENT_1PASSWORD_ITEM`                  | unset                          | 1Password item title/ID to load as the `default` payment profile                              |
+| `PAYMENT_1PASSWORD_ITEMS`                 | unset                          | JSON object of profile keys to 1Password item specs                                           |
+| `PAYMENT_1PASSWORD_PROFILE`               | `default`                      | profile key for `PAYMENT_1PASSWORD_ITEM`                                                      |
+| `PAYMENT_1PASSWORD_ADDRESS_ITEM`          | unset                          | optional Identity/address item used for both billing and shipping                             |
+| `PAYMENT_1PASSWORD_BILLING_ADDRESS_ITEM`  | unset                          | optional billing Identity/address item                                                        |
+| `PAYMENT_1PASSWORD_SHIPPING_ADDRESS_ITEM` | unset                          | optional shipping Identity/address item                                                       |
+| `PAYMENT_1PASSWORD_VAULT`                 | unset                          | optional 1Password vault passed to `op item get --vault`                                      |
+| `OP_CLI`                                  | `op`                           | 1Password CLI executable                                                                      |
+| `CHROME`                                  | auto-detect                    | Chromium/Chrome binary path                                                                   |
+| `IDLE_BROWSER_TIMEOUT_SECS`               | `3600`                         | CDP idle timeout; headless_chrome defaults to 30s, which breaks chat while waiting on the LLM |
+| `VNC_PORT`, `NOVNC_PORT`, `SCREEN`, …     | see daemon                     | display stack tuning                                                                          |
+
 
 ## Browser Tool
 
@@ -282,8 +268,8 @@ cargo build --no-default-features
 
 When checkout needs you:
 
-- **`mode: review`** — order summary + basket/page screenshot in terminal when supported, plus a saved PNG path; open `handoff_url` only to submit
-- **`mode: interactive`** — bank/app auth (e.g. Lloyds); use `handoff_url`, then tell Emissary you're done so it sends `{ "op": "resume" }`
+- `**mode: review**` — order summary + basket/page screenshot in terminal when supported, plus a saved PNG path; open `handoff_url` only to submit
+- `**mode: interactive**` — bank/app auth (e.g. Lloyds); use `handoff_url`, then tell Emissary you're done so it sends `{ "op": "resume" }`
 
 Payment and address secrets stay in the vault. Wrong card details are tolerable; blocked submits and bank 2FA are not.
 
@@ -300,10 +286,13 @@ Shipping and billing address data can live in the same item or in separate Ident
 
 ## Commands
 
-| command | purpose |
-|---|---|
-| `chat` | start harness + daemon; accepts an optional one-shot prompt |
-| `setup` | configure gitignored 1Password item references |
-| `stop` | clean stale daemon lock/processes |
-| `schema` | print browser tool schema |
-| `run` | one-shot headless action batch |
+
+| command  | purpose                                                     |
+| -------- | ----------------------------------------------------------- |
+| `chat`   | start harness + daemon; accepts an optional one-shot prompt |
+| `setup`  | configure gitignored 1Password item references              |
+| `stop`   | clean stale daemon lock/processes                           |
+| `schema` | print browser tool schema                                   |
+| `run`    | one-shot headless action batch                              |
+
+
