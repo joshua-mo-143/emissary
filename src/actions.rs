@@ -2,6 +2,7 @@ use crate::browser_dom::FRAME_HELPERS;
 use crate::payment::{
     PaymentFieldMapping, PaymentVault, block_type_on_credential_field, is_sensitive_submit,
 };
+use crate::privacy::redact_value_strings;
 use crate::review::{self, HandoffPayload, HandoffReason, capture_order_review};
 use anyhow::{Result, bail};
 use headless_chrome::Tab;
@@ -917,7 +918,7 @@ fn clickable_details(tab: &Tab, selector: &str) -> Result<String> {
 }
 
 pub fn outcome_to_json(outcome: RunOutcome) -> Value {
-    match outcome {
+    let mut value = match outcome {
         RunOutcome::Success(success) => json!(success),
         RunOutcome::Failed(failure) => json!(failure),
         RunOutcome::NeedsHuman {
@@ -935,7 +936,9 @@ pub fn outcome_to_json(outcome: RunOutcome) -> Value {
             }
             handoff
         }
-    }
+    };
+    redact_value_strings(&mut value);
+    value
 }
 
 #[cfg(test)]

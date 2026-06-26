@@ -5,6 +5,7 @@ use crate::conversation::{
 };
 use crate::daemon::{ManagedDaemon, install_shutdown_handler, runtime_dir};
 use crate::image_display::{self, InlineImageResult};
+use crate::privacy::redact_value_strings;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -710,6 +711,7 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          - If pageState is bot_challenge or mode is blocked, stop retrying automation. Ask whether to use another site, continue manually in a normal browser, or retry after the user has cleared Cloudflare outside the harness.\n\
          Credentials:\n\
          - Never put card numbers, CVV, shipping address, billing address, email, or phone in tool arguments.\n\
+         - Browser tool results redact visible shipping/billing address, email, and phone details before they reach you. Treat redacted address text as intentionally unavailable; do not ask the browser to recover exact values.\n\
          - Use fillPayment with a profile key when checkout needs card details.\n\
          - Use fillAddress with kind `shipping` or `billing` when checkout needs address/contact fields. Loaded profiles: {profiles}.\n\
          - If no payment profile is loaded and a task needs checkout credentials, ask the user to run setup before continuing.\n\
@@ -932,6 +934,7 @@ fn show_browser_error_to_user(body: &Value) {
 fn format_tool_result_for_model(body: &Value) -> String {
     let mut sanitized = body.clone();
     strip_screenshot_data(&mut sanitized);
+    redact_value_strings(&mut sanitized);
     let mut out = Map::new();
     if let Value::Object(map) = sanitized {
         out.extend(map);

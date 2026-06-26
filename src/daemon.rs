@@ -1,5 +1,6 @@
 use crate::actions::{Action, RunContext, RunOutcome, RunRequest, run_actions, tool_schema};
 use crate::payment::PaymentVault;
+use crate::privacy::redact_value_strings;
 use crate::review::{HandoffReason, handoff_payload};
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
@@ -212,11 +213,13 @@ impl ManagedDaemon {
                 .iter()
                 .all(|action| matches!(action, Action::Resume))
         {
-            return Ok(BrowserRunResult::needs_human(json!(handoff_payload(
-                &runtime.tab,
-                &runtime.session_id,
-                &runtime.handoff_url,
-                HandoffReason::already_paused(),
+            return Ok(BrowserRunResult::needs_human(sanitize_browser_body(json!(
+                handoff_payload(
+                    &runtime.tab,
+                    &runtime.session_id,
+                    &runtime.handoff_url,
+                    HandoffReason::already_paused(),
+                )
             ))));
         }
 
@@ -229,11 +232,15 @@ impl ManagedDaemon {
         };
 
         match run_actions(&mut context, &run_request)? {
-            RunOutcome::Success(success) => Ok(BrowserRunResult::success(json!(success))),
-            RunOutcome::Failed(failure) => Ok(BrowserRunResult::error(json!(failure))),
-            RunOutcome::NeedsHuman { handoff, .. } => {
-                Ok(BrowserRunResult::needs_human(json!(handoff)))
-            }
+            RunOutcome::Success(success) => Ok(BrowserRunResult::success(sanitize_browser_body(
+                json!(success),
+            ))),
+            RunOutcome::Failed(failure) => Ok(BrowserRunResult::error(sanitize_browser_body(
+                json!(failure),
+            ))),
+            RunOutcome::NeedsHuman { handoff, .. } => Ok(BrowserRunResult::needs_human(
+                sanitize_browser_body(json!(handoff)),
+            )),
         }
     }
 
@@ -247,6 +254,11 @@ impl ManagedDaemon {
             .as_ref()
             .expect("Emissary daemon is not running")
     }
+}
+
+fn sanitize_browser_body(mut body: Value) -> Value {
+    redact_value_strings(&mut body);
+    body
 }
 
 impl Drop for ManagedDaemon {
