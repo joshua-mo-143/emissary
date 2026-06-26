@@ -104,6 +104,28 @@ const SAFE_PAYMENT_CONTINUE_PATTERNS: &[&str] = &[
     "save and continue",
 ];
 
+const POSTCODE_SUBMIT_PATTERNS: &[&str] = &[
+    "apply",
+    "continue",
+    "deliver",
+    "delivery",
+    "find",
+    "food",
+    "go",
+    "next",
+    "postcode",
+    "postal",
+    "restaurant",
+    "search",
+    "show",
+    "start order",
+    "submit",
+    "takeaway",
+    "use this address",
+    "view",
+    "zip",
+];
+
 pub struct SecretString(String);
 
 impl SecretString {
@@ -187,6 +209,32 @@ struct PaymentContinueCandidate {
     label: String,
     details: String,
     tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostcodeSubmitCandidate {
+    #[serde(rename = "refId")]
+    ref_id: String,
+    label: String,
+    details: String,
+    tag: String,
+    scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostcodeFieldDetails {
+    label: String,
+    tag: String,
+    frame: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostcodeFillDiscovery {
+    filled: bool,
+    reason: Option<String>,
+    field: Option<PostcodeFieldDetails>,
+    #[serde(default)]
+    candidates: Vec<PostcodeSubmitCandidate>,
 }
 
 impl PaymentVault {
@@ -483,6 +531,58 @@ impl PaymentVault {
         }))
     }
 
+    pub fn fill_postcode_and_submit(
+        tab: &Tab,
+        vault: &PaymentVault,
+        profile_key: &str,
+        kind: Option<&str>,
+        redactions: &mut Vec<String>,
+    ) -> Result<Value> {
+        let kind = parse_address_kind(kind)?;
+        let postcode = vault.postcode_secret(profile_key, kind)?;
+        register_redaction(redactions, postcode.expose());
+
+        let discovery = fill_postcode_and_discover_submit(tab, postcode.expose())?;
+        if !discovery.filled {
+            bail!(
+                "{}",
+                discovery
+                    .reason
+                    .as_deref()
+                    .unwrap_or("no visible postcode or delivery-location field was found")
+            );
+        }
+
+        let selected = discovery
+            .candidates
+            .iter()
+            .find(|candidate| {
+                is_safe_postcode_submit(&candidate.label, &candidate.details)
+                    && !is_sensitive_submit(&candidate.details)
+            })
+            .ok_or_else(|| postcode_submit_selection_error(&discovery.candidates))?;
+
+        let clicked = click_postcode_submit_ref(tab, &selected.ref_id)?;
+        thread::sleep(Duration::from_millis(750));
+
+        let field = discovery.field.as_ref();
+        Ok(json!({
+            "filled_postcode": profile_key,
+            "kind": kind.as_str(),
+            "field": {
+                "label": field.map(|field| field.label.as_str()).unwrap_or_default(),
+                "tag": field.map(|field| field.tag.as_str()).unwrap_or_default(),
+                "frame": field.and_then(|field| field.frame.as_deref()),
+            },
+            "submitted": {
+                "label": selected.label.as_str(),
+                "tag": selected.tag.as_str(),
+                "scope": selected.scope.as_str(),
+                "clicked": clicked.get("clicked").cloned().unwrap_or_else(|| json!(true)),
+            },
+        }))
+    }
+
     pub fn fill_payment_and_continue(
         tab: &Tab,
         vault: &PaymentVault,
@@ -566,6 +666,18 @@ impl PaymentVault {
         })?;
         Ok(SecretString::new(value))
     }
+
+    fn postcode_secret(&self, profile_key: &str, kind: AddressKind) -> Result<SecretString> {
+        self.address_secret(profile_key, kind, "postal_code")
+            .or_else(|address_error| {
+                self.secret(profile_key, "postal_code").with_context(|| {
+                    format!(
+                        "payment profile `{profile_key}` has no {} address postal_code ({address_error})",
+                        kind.as_str()
+                    )
+                })
+            })
+    }
 }
 
 pub fn is_sensitive_submit(details: &str) -> bool {
@@ -610,6 +722,17 @@ pub fn is_safe_payment_continue(details: &str) -> bool {
 
     let lower = details.to_lowercase();
     SAFE_PAYMENT_CONTINUE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+pub fn is_safe_postcode_submit(label: &str, details: &str) -> bool {
+    if is_sensitive_submit(details) {
+        return false;
+    }
+
+    let lower = format!("{label}\n{details}").to_lowercase();
+    POSTCODE_SUBMIT_PATTERNS
         .iter()
         .any(|pattern| lower.contains(pattern))
 }
@@ -727,6 +850,227 @@ fn click_payment_continue_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("auto payment continue failed")
+        )
+    }
+}
+
+fn register_redaction(redactions: &mut Vec<String>, secret: &str) {
+    let secret = secret.trim();
+    if secret.len() >= 3 && !redactions.iter().any(|redaction| redaction == secret) {
+        redactions.push(secret.to_owned());
+    }
+}
+
+fn postcode_submit_selection_error(candidates: &[PostcodeSubmitCandidate]) -> anyhow::Error {
+    let final_labels = candidates
+        .iter()
+        .filter(|candidate| {
+            is_sensitive_submit(&candidate.label) || is_sensitive_submit(&candidate.details)
+        })
+        .map(|candidate| candidate.label.trim())
+        .filter(|label| !label.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+
+    if !final_labels.is_empty() {
+        return anyhow!(
+            "postcode filled, but only final submit controls were visible: {}",
+            final_labels.join(", ")
+        );
+    }
+
+    let labels = candidates
+        .iter()
+        .map(|candidate| candidate.label.trim())
+        .filter(|label| !label.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        anyhow!("postcode filled, but no safe search/continue control was visible")
+    } else {
+        anyhow!(
+            "postcode filled, but no safe postcode search/continue control matched visible candidates: {}",
+            labels.join(", ")
+        )
+    }
+}
+
+fn fill_postcode_and_discover_submit(tab: &Tab, postcode: &str) -> Result<PostcodeFillDiscovery> {
+    let postcode_json = serde_json::to_string(postcode)?;
+    let js = format!(
+        r##"{FRAME_HELPERS}
+        (() => {{
+            const postcode = {postcode_json};
+            const clickableSelector = [
+                "button",
+                "a[href]",
+                "input[type='button']",
+                "input[type='submit']",
+                "[role='button']"
+            ].join(",");
+
+            function labelledByText(el) {{
+                const id = el.getAttribute("aria-labelledby");
+                if (!id) return "";
+                return id.split(/\s+/)
+                    .map((part) => el.ownerDocument.getElementById(part))
+                    .filter(Boolean)
+                    .map((label) => label.innerText || label.textContent)
+                    .map(emissaryClean)
+                    .filter(Boolean)
+                    .join(" ");
+            }}
+
+            function labelForField(el) {{
+                const labels = Array.from(el.labels || [])
+                    .map((label) => label.innerText || label.textContent)
+                    .map(emissaryClean)
+                    .filter(Boolean);
+                return [
+                    ...labels,
+                    labelledByText(el),
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("placeholder"),
+                    el.getAttribute("title"),
+                    el.getAttribute("autocomplete"),
+                    el.getAttribute("name"),
+                    el.id,
+                    el.closest("form") && el.closest("form").innerText
+                ].map(emissaryClean).filter(Boolean).join(" ").slice(0, 2000);
+            }}
+
+            function labelForClickable(el) {{
+                return [
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("title"),
+                    el.getAttribute("value"),
+                    el.getAttribute("name"),
+                    el.id
+                ].map(emissaryClean).filter(Boolean)[0] || "";
+            }}
+
+            function detailsForClickable(el) {{
+                const form = el.closest("form");
+                return [
+                    labelForClickable(el),
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("title"),
+                    el.getAttribute("value"),
+                    el.getAttribute("name"),
+                    el.id,
+                    form && form.innerText
+                ].map(emissaryClean).filter(Boolean).join("\n").slice(0, 2000);
+            }}
+
+            function fieldMatches(el) {{
+                if (el.disabled || el.readOnly || !emissaryVisible(el)) return false;
+                const type = (el.getAttribute("type") || "").toLowerCase();
+                if (["hidden", "password", "checkbox", "radio", "file"].includes(type)) return false;
+                const hay = labelForField(el).toLowerCase();
+                return /post\s*code|postcode|postal|zip|delivery address|deliver to|where.*deliver|enter.*address/.test(hay);
+            }}
+
+            function collectCandidates(root, scope, path) {{
+                const candidates = [];
+                for (const el of root.querySelectorAll(clickableSelector)) {{
+                    if (!emissaryVisible(el) || el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+                    const label = labelForClickable(el);
+                    const details = detailsForClickable(el);
+                    if (!label && !details) continue;
+                    const refId = `ps${{candidates.length + 1}}`;
+                    el.setAttribute("data-emissary-postcode-submit-ref", refId);
+                    candidates.push({{
+                        refId,
+                        label,
+                        details,
+                        tag: el.tagName.toLowerCase(),
+                        scope,
+                        frame: emissaryFrameName(path)
+                    }});
+                }}
+                return candidates;
+            }}
+
+            for (const ctx of emissaryFrameDocuments()) {{
+                if (ctx.frameElement && !emissaryVisible(ctx.frameElement)) continue;
+                for (const el of ctx.doc.querySelectorAll("input:not([type='hidden']), textarea")) {{
+                    if (!fieldMatches(el)) continue;
+                    emissaryScrollIntoView(ctx, el);
+                    el.focus();
+                    el.value = postcode;
+                    el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: postcode }}));
+                    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+                    const form = el.closest("form");
+                    let candidates = form ? collectCandidates(form, "form", ctx.path) : [];
+                    if (candidates.length === 0) {{
+                        candidates = collectCandidates(ctx.doc, "page", ctx.path);
+                    }}
+
+                    return JSON.stringify({{
+                        filled: true,
+                        field: {{
+                            label: labelForField(el).slice(0, 200),
+                            tag: el.tagName.toLowerCase(),
+                            frame: emissaryFrameName(ctx.path)
+                        }},
+                        candidates
+                    }});
+                }}
+            }}
+
+            return JSON.stringify({{
+                filled: false,
+                reason: "no visible postcode or delivery-location field was found"
+            }});
+        }})()"##
+    );
+
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    Ok(serde_json::from_str(&value_to_string(raw))?)
+}
+
+fn click_postcode_submit_ref(tab: &Tab, ref_id: &str) -> Result<Value> {
+    let ref_json = serde_json::to_string(ref_id)?;
+    let js = format!(
+        r##"{FRAME_HELPERS}
+        (() => {{
+            const refId = {ref_json};
+            const match = emissaryFindByAttribute(refId, "data-emissary-postcode-submit-ref");
+            if (!match) {{
+                return JSON.stringify({{
+                    clicked: false,
+                    reason: "safe postcode submit control disappeared"
+                }});
+            }}
+            const el = match.el;
+            emissaryScrollIntoView(match, el);
+            el.click();
+            return JSON.stringify({{
+                clicked: true,
+                frame: emissaryFrameName(match.path),
+                label: (el.innerText || el.textContent || el.getAttribute("value") || "").trim(),
+                tag: el.tagName.toLowerCase()
+            }});
+        }})()"##
+    );
+    let raw = tab.evaluate(&js, true)?.value.unwrap_or(Value::Null);
+    let details: Value = serde_json::from_str(&value_to_string(raw))?;
+    if details
+        .get("clicked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(details)
+    } else {
+        bail!(
+            "{}",
+            details
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("postcode submit failed")
         )
     }
 }
@@ -1909,9 +2253,9 @@ fn inject_into_ref(tab: &Tab, ref_id: &str, value: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressKind, OnePasswordProfileRefs, is_safe_payment_continue, is_sensitive_submit,
-        parse_address_field_ref, parse_field_ref, parse_onepassword_file_config,
-        parse_onepassword_item_json, parse_onepassword_items,
+        AddressKind, OnePasswordProfileRefs, is_safe_payment_continue, is_safe_postcode_submit,
+        is_sensitive_submit, parse_address_field_ref, parse_field_ref,
+        parse_onepassword_file_config, parse_onepassword_item_json, parse_onepassword_items,
     };
     #[test]
     fn blocks_final_purchase_actions() {
@@ -1936,6 +2280,21 @@ mod tests {
         assert!(is_safe_payment_continue("Continue to review order"));
         assert!(!is_safe_payment_continue("Pay now"));
         assert!(!is_safe_payment_continue("Complete purchase"));
+    }
+
+    #[test]
+    fn classifies_safe_postcode_submit_controls() {
+        assert!(is_safe_postcode_submit("Find food", "Find food"));
+        assert!(is_safe_postcode_submit(
+            "Search",
+            "Enter your postcode\nSearch"
+        ));
+        assert!(is_safe_postcode_submit(
+            "Continue",
+            "Delivery address\nPostcode\nContinue"
+        ));
+        assert!(!is_safe_postcode_submit("Pay now", "Postcode\nPay now"));
+        assert!(!is_safe_postcode_submit("Help", "Help"));
     }
 
     #[test]

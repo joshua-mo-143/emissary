@@ -712,6 +712,7 @@ fn system_prompt(payment_keys: &[String], status: &Value) -> String {
          - Never put card numbers, CVV, shipping address, billing address, email, or phone in tool arguments.\n\
          - Use fillPayment with a profile key when checkout needs card details.\n\
          - Use fillAddress with kind `shipping` or `billing` when checkout needs address/contact fields. Loaded profiles: {profiles}.\n\
+         - For delivery/takeaway location gates that only need a postcode or postal code, use submitPostcode with kind `shipping`; never ask for or type the postcode value. The runtime fills it from the vault and redacts it from tool output.\n\
          - If no payment profile is loaded and a task needs checkout credentials, ask the user to run setup before continuing.\n\
          Payment:\n\
          - Never put card numbers, CVV, or any payment secret values in tool arguments.\n\

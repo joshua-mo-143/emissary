@@ -44,6 +44,7 @@ fn run_cli(request_json: Option<&Path>) -> Result<()> {
         paused: None,
         session_id: &session,
         handoff_url: "",
+        redactions: Vec::new(),
     };
     let outcome = run_actions(&mut context, &request)?;
     println!(

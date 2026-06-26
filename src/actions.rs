@@ -94,6 +94,13 @@ pub enum Action {
         selector: String,
         field: String,
     },
+    /// Fill a location/postcode gate from the vault and click a guarded non-final submit/search control.
+    SubmitPostcode {
+        #[serde(default = "default_payment_profile_key")]
+        profile: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
     Screenshot {
         #[serde(default)]
         selector: Option<String>,
@@ -187,6 +194,7 @@ pub struct RunContext<'a> {
     pub paused: Option<&'a mut bool>,
     pub session_id: &'a str,
     pub handoff_url: &'a str,
+    pub redactions: Vec<String>,
 }
 
 pub fn tool_schema() -> Value {
@@ -238,7 +246,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
             failed_at: 0,
             error: "actions must contain at least one item".to_owned(),
             results: Vec::new(),
-            current_page: current_page_snapshot(context.tab.as_ref()),
+            current_page: current_page_snapshot(context),
         }));
     }
 
@@ -246,11 +254,14 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
 
     for (index, action) in request.actions.iter().enumerate() {
         match execute_action(context, action) {
-            Ok(ok) => results.push(ActionResult {
-                index,
-                op: op_name(action).to_owned(),
-                ok,
-            }),
+            Ok(mut ok) => {
+                redact_value(&mut ok, &context.redactions);
+                results.push(ActionResult {
+                    index,
+                    op: op_name(action).to_owned(),
+                    ok,
+                });
+            }
             Err(error) => {
                 if let Some(reason) = review::handoff_reason(&error) {
                     let handoff = review::handoff_payload(
@@ -275,7 +286,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
                     failed_at: index,
                     error: format!("action {index} ({}): {message}", action_detail(action)),
                     results,
-                    current_page: current_page_snapshot(context.tab.as_ref()),
+                    current_page: current_page_snapshot(context),
                 }));
             }
         }
@@ -301,7 +312,7 @@ pub fn run_actions(context: &mut RunContext<'_>, request: &RunRequest) -> Result
         status: "ok",
         completed: results.len(),
         results,
-        current_page: current_page_snapshot(context.tab.as_ref()),
+        current_page: current_page_snapshot(context),
     }))
 }
 
@@ -323,7 +334,7 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
             review::ensure_not_bot_challenge(tab)?;
             Ok(json!({ "url": url, "title": tab.get_title()? }))
         }
-        Action::Observe => Ok(json!(current_page_snapshot(tab))),
+        Action::Observe => Ok(json!(current_page_snapshot(context))),
         Action::Click { selector } => {
             let element = wait_for_target(tab, selector)
                 .map_err(|error| enrich_selector_error(selector, error))?;
@@ -393,6 +404,13 @@ fn execute_action(context: &mut RunContext<'_>, action: &Action) -> Result<Value
         Action::FillAddressField { selector, field } => {
             PaymentVault::fill_address_field(tab, context.payment, selector, field)
         }
+        Action::SubmitPostcode { profile, kind } => PaymentVault::fill_postcode_and_submit(
+            tab,
+            context.payment,
+            profile,
+            kind.as_deref(),
+            &mut context.redactions,
+        ),
         Action::AutoFillPaymentAndContinue { profile } => {
             let result = PaymentVault::fill_payment_and_continue(tab, context.payment, profile)
                 .map_err(|_| review::handoff_required(HandoffReason::manual()))?;
@@ -445,6 +463,7 @@ fn op_name(action: &Action) -> &'static str {
         Action::FillPaymentField { .. } => "fillPaymentField",
         Action::FillAddress { .. } => "fillAddress",
         Action::FillAddressField { .. } => "fillAddressField",
+        Action::SubmitPostcode { .. } => "submitPostcode",
         Action::AutoFillPaymentAndContinue { .. } => "autoFillPaymentAndContinue",
         Action::Screenshot { .. } => "screenshot",
         Action::Review => "review",
@@ -455,6 +474,10 @@ fn op_name(action: &Action) -> &'static str {
 
 fn default_body_selector() -> String {
     "body".to_owned()
+}
+
+fn default_payment_profile_key() -> String {
+    "default".to_owned()
 }
 
 fn action_detail(action: &Action) -> String {
@@ -488,6 +511,9 @@ fn action_detail(action: &Action) -> String {
         }
         Action::FillAddressField { selector, field } => {
             format!("fillAddressField selector={selector:?} field={field}")
+        }
+        Action::SubmitPostcode { profile, kind } => {
+            format!("submitPostcode profile={profile} kind={kind:?}")
         }
         Action::AutoFillPaymentAndContinue { profile } => {
             format!("autoFillPaymentAndContinue profile={profile}")
@@ -609,8 +635,9 @@ fn selector_value(tab: &Tab, selector: &str, property: &str) -> Result<Value> {
     Ok(tab.evaluate(&js, false)?.value.unwrap_or(Value::Null))
 }
 
-fn current_page_snapshot(tab: &Tab) -> PageSnapshot {
-    PageSnapshot {
+fn current_page_snapshot(context: &RunContext<'_>) -> PageSnapshot {
+    let tab = context.tab.as_ref();
+    let mut snapshot = PageSnapshot {
         title: tab.get_title().unwrap_or_default(),
         page_text: page_text_snapshot(tab)
             .ok()
@@ -618,7 +645,9 @@ fn current_page_snapshot(tab: &Tab) -> PageSnapshot {
             .unwrap_or_default(),
         elements: observe_elements(tab).unwrap_or_default(),
         page_state: review::page_state_label(tab).map(str::to_owned),
-    }
+    };
+    redact_snapshot(&mut snapshot, &context.redactions);
+    snapshot
 }
 
 fn page_text_snapshot(tab: &Tab) -> Result<String> {
@@ -865,6 +894,81 @@ fn parse_json_string(value: Value) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
+fn redact_snapshot(snapshot: &mut PageSnapshot, redactions: &[String]) {
+    snapshot.title = redact_text(&snapshot.title, redactions);
+    snapshot.page_text = redact_text(&snapshot.page_text, redactions);
+    for element in &mut snapshot.elements {
+        element.label = redact_text(&element.label, redactions);
+    }
+}
+
+fn redact_value(value: &mut Value, redactions: &[String]) {
+    match value {
+        Value::String(text) => {
+            *text = redact_text(text, redactions);
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_value(item, redactions);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_value(nested, redactions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_text(text: &str, redactions: &[String]) -> String {
+    redactions
+        .iter()
+        .flat_map(|secret| redaction_variants(secret))
+        .fold(text.to_owned(), |current, secret| {
+            redact_ascii_case_insensitive(&current, &secret, "[redacted postcode]")
+        })
+}
+
+fn redaction_variants(secret: &str) -> Vec<String> {
+    let trimmed = secret.trim();
+    if trimmed.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut variants = vec![trimmed.to_owned()];
+    let compact = trimmed
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact.len() >= 3 && !variants.iter().any(|variant| variant == &compact) {
+        variants.push(compact);
+    }
+    variants
+}
+
+fn redact_ascii_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return text.to_owned();
+    }
+
+    let lower_text = text.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some(relative_start) = lower_text[cursor..].find(&lower_needle) {
+        let start = cursor + relative_start;
+        let end = start + lower_needle.len();
+        output.push_str(&text[cursor..start]);
+        output.push_str(replacement);
+        cursor = end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
 fn truncate_page_text(text: String) -> String {
     const MAX_CHARS: usize = 12_000;
     if text.len() <= MAX_CHARS {
@@ -940,7 +1044,10 @@ pub fn outcome_to_json(outcome: RunOutcome) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, RunRequest, enrich_selector_error, truncate_page_text};
+    use super::{
+        Action, RunRequest, enrich_selector_error, redact_text, redact_value, truncate_page_text,
+    };
+    use serde_json::json;
 
     #[test]
     fn truncates_long_page_text() {
@@ -999,6 +1106,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_submit_postcode_action() {
+        let request: RunRequest = serde_json::from_str(
+            r#"{"actions":[{"op":"submitPostcode","profile":"default","kind":"shipping"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.actions[0], Action::SubmitPostcode { .. }));
+    }
+
+    #[test]
     fn parses_screenshot_action() {
         let request: RunRequest =
             serde_json::from_str(r#"{"actions":[{"op":"screenshot","selector":"img.product"}]}"#)
@@ -1017,6 +1133,28 @@ mod tests {
             request.actions[1],
             Action::FillAddressField { .. }
         ));
+    }
+
+    #[test]
+    fn redacts_postcode_variants() {
+        let redactions = vec!["SW1A 1AA".to_owned()];
+        assert_eq!(
+            redact_text("Delivering to sw1a 1aa and SW1A1AA", &redactions),
+            "Delivering to [redacted postcode] and [redacted postcode]"
+        );
+
+        let mut value = json!({
+            "pageText": "Restaurants near SW1A 1AA",
+            "nested": ["sw1a1aa"]
+        });
+        redact_value(&mut value, &redactions);
+        assert_eq!(
+            value,
+            json!({
+                "pageText": "Restaurants near [redacted postcode]",
+                "nested": ["[redacted postcode]"]
+            })
+        );
     }
 
     #[test]
