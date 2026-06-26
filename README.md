@@ -220,6 +220,18 @@ For payment forms, use the same ref flow without exposing card values:
 
 `field` is a vault credential ID, not a secret value. Supported IDs are `card_number`, `exp`, `exp_month`, `exp_year`, `cvc`, `name`, and `postal_code`, optionally prefixed with a profile such as `default:cvc`.
 
+For takeaway or delivery sites that ask for only a postcode before showing restaurants, use the guarded postcode submit action instead of typing the postcode into a normal `type`/`typeRef` action:
+
+```json
+{
+  "actions": [
+    { "op": "submitPostcode", "profile": "default", "kind": "shipping" }
+  ]
+}
+```
+
+`submitPostcode` fills the postcode from the selected profile's shipping address by default, falls back to the profile postal code when needed, and clicks only a non-final search/continue-style control. The postcode value is never accepted in tool arguments and is redacted from subsequent browser tool text output.
+
 When the basket/order summary has already been reviewed and the flow reaches card entry, prefer the guarded runtime-owned payment continuation:
 
 ```json

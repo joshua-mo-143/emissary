@@ -226,6 +226,7 @@ impl ManagedDaemon {
             paused: Some(&mut runtime.paused),
             session_id: &runtime.session_id,
             handoff_url: &runtime.handoff_url,
+            redactions: Vec::new(),
         };
 
         match run_actions(&mut context, &run_request)? {
