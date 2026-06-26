@@ -53,7 +53,7 @@ Venice is OpenAI-compatible; the harness calls `/chat/completions` with tool cal
 1. **Single Rust crate.** Do not add a TypeScript/Node harness or split runtimes without an explicit request.
 2. **Daemon lifetime = chat lifetime.** `ManagedDaemon` starts in `chat`, shuts down on `exit`, normal return, or Ctrl+C. Do not reintroduce a standalone `serve` workflow as the default path.
 3. **Browser tool is the capability boundary.** The LLM sends whitelisted JSON actions only (`Action` enum). No arbitrary JS eval from the model beyond the explicit `eval` action.
-4. **Secrets stay out of the LLM.** Credit card and shipping/billing address data must come only from 1Password-backed `PaymentVault` keys (`fillPayment`, `fillAddress`), never from local JSON files, tool arguments, or responses. Strip screenshot base64 before returning tool results to the model.
+4. **Secrets stay out of the LLM.** Credit card and shipping/billing address data must come only from 1Password-backed `PaymentVault` keys (`fillPayment`, `fillAddress`), never from local JSON files, tool arguments, or responses. Redact visible address/contact text from browser results, and strip screenshot base64 before returning tool results to the model.
 5. **Handoff is intentional.** Final purchase clicks and bank 2FA pause automation and surface `needs_human` with basket review or `handoff_url`.
 6. **Review excludes payment UI.** `review` captures order summary regions only; do not screenshot card fields.
 

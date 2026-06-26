@@ -1,3 +1,4 @@
+use crate::privacy::redact_reasoning_text;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use headless_chrome::{Tab, protocol::cdp::Page::CaptureScreenshotFormatOption};
@@ -614,11 +615,13 @@ fn clear_review_target(tab: &Tab) -> Result<()> {
 }
 
 pub fn sanitize_summary_text(text: &str) -> String {
-    text.lines()
+    let summary = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !is_payment_line(line))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    redact_reasoning_text(&summary)
 }
 
 fn is_payment_line(line: &str) -> bool {

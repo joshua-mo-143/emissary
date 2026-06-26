@@ -6,6 +6,7 @@ mod daemon;
 mod harness;
 mod image_display;
 mod payment;
+mod privacy;
 mod review;
 
 use actions::{RunContext, outcome_to_json, run_actions, tool_schema};

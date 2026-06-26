@@ -9,7 +9,7 @@ This codebase is still early stage. Expect breaking changes.
 - Runs a managed local Chrome session with Xvfb, noVNC, and websockify.
 - Exposes one LLM tool, `browser`, with whitelisted JSON actions.
 - Prefers `observe` -&gt; `clickRef` / `typeRef` so the agent acts on visible page elements instead of brittle selectors.
-- Keeps payment and address secrets out of prompts by loading checkout data directly from 1Password.
+- Keeps payment and address secrets out of prompts by loading checkout data directly from 1Password and redacting visible address/contact details from browser results before they reach the model.
 - Blocks final purchase submits and bank/app authentication behind explicit human handoff.
 
 ## Quick start
@@ -98,7 +98,7 @@ op item get "Personal Visa" --format json --reveal
 op item get "Home Address" --format json
 ```
 
-Do not commit secrets or decrypted item JSON. Emissary reads secrets directly from `op` when payment profiles are configured and keeps card/address values out of LLM prompts and tool results.
+Do not commit secrets or decrypted item JSON. Emissary reads secrets directly from `op` when payment profiles are configured and keeps card/address values out of LLM prompts and tool results. Browser result text is also redacted for visible shipping/billing addresses, email addresses, and phone numbers so saved checkout addresses are not exposed to the reasoning layer.
 
 ### Persistent Conversations
 
